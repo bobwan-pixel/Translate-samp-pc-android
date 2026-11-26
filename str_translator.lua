@@ -232,7 +232,7 @@ local function callGemini(system, text, cb)
         systemInstruction = { parts = { { text = system } } },
         contents = { { role = 'user', parts = { { text = text } } } },
     })
-    httpPost(url, body, 'x-goog-api-key', cfg.gemini_key, function(ok, code, resp)
+    local function handle(ok, code, resp)
         if not ok then return cb(false, resp, code) end
         if code ~= 200 then return cb(false, apiErrorText(code, resp), code) end
         local okj, j = pcall(decodeJson, resp)
@@ -250,6 +250,15 @@ local function callGemini(system, text, cb)
         local result = trim(table.concat(out, ' '))
         if result == '' then return cb(false, 'jawaban Gemini kosong', code) end
         cb(true, result, code)
+    end
+    -- cara 1: key lewat header x-goog-api-key (cara resmi, juga untuk key format baru "AQ.")
+    httpPost(url, body, 'x-goog-api-key', cfg.gemini_key, function(ok, code, resp)
+        if ok and code == 401 then
+            -- cara 2: coba sekali lagi dengan key di URL (?key=)
+            local key = cfg.gemini_key:gsub('[^%w%-%._~]', function(c) return ('%%%02X'):format(c:byte()) end)
+            return httpPost(url .. '?key=' .. key, body, 'Accept', 'application/json', handle)
+        end
+        handle(ok, code, resp)
     end)
 end
 
@@ -552,8 +561,12 @@ local function keyInfo(key, expectPrefix)
         return
     end
     local info = ('  %d karakter, awalan "%s..."'):format(#k, k:sub(1, 4))
-    if expectPrefix and k:sub(1, #expectPrefix) ~= expectPrefix then
-        colored(1, 0.6, 0.3, info .. '  -> biasanya diawali "' .. expectPrefix .. '"')
+    local okPrefix = not expectPrefix
+    for p in (expectPrefix or ''):gmatch('[^|]+') do
+        if k:sub(1, #p) == p then okPrefix = true end
+    end
+    if not okPrefix then
+        colored(1, 0.6, 0.3, info .. '  -> biasanya diawali ' .. expectPrefix:gsub('|', ' / '))
     else
         colored(0.6, 0.9, 0.6, info)
     end
@@ -620,7 +633,7 @@ imgui.OnFrame(function() return ui.show[0] end, function()
             colored(0.5, 0.8, 1, 'Gemini (utama)')
             imgui.SetNextItemWidth(380)
             inputText('API key Gemini', 'gemini_key', keyFlags)
-            keyInfo('gemini_key', 'AIza')
+            keyInfo('gemini_key', 'AIza|AQ.')
             imgui.SetNextItemWidth(250)
             inputText('Model Gemini', 'gemini_model')
             imgui.Spacing()
