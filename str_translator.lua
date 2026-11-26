@@ -1,6 +1,6 @@
 --[[
     STR Translator - MoonLoader (SA-MP)
-    Penerjemah chat otomatis pakai AI: Gemini (utama) -> Grok (cadangan).
+    Penerjemah chat otomatis pakai AI: Gemini (utama) -> Groq (cadangan).
 
     Perintah:
       /str        buka / tutup menu
@@ -12,6 +12,8 @@
       - mimgui
       - effil
       - lua-requests (requests) + luasocket + luasec (ssl)  -> untuk HTTPS
+
+    API: Gemini (aistudio.google.com) dan Groq (console.groq.com, key diawali gsk_)
       - encoding
 ]]
 
@@ -48,6 +50,11 @@ local LANGS = {
     { label = 'Turki',            name = 'Turkish' },
     { label = 'Polandia',         name = 'Polish' },
     { label = 'Rusia',            name = 'Russian' },
+    -- gaya bahasa (ditaruh di akhir supaya pilihan lama di config tidak bergeser)
+    { label = 'Inggris slang jalanan US', name = 'English',
+      style = 'Write it like casual American street slang / hood talk (words like bro, ain\'t, finna, y\'all, deadass, lowkey, fr, cuz), the way young people talk on the streets in the US. Keep it natural and easy to understand, do not overdo it.' },
+    { label = 'Spanyol Meksiko (slang)', name = 'Mexican Spanish',
+      style = 'Write it like casual Mexican street Spanish with Mexican slang (words like wey, neta, chido, que onda, orale, carnal, no manches), the way people talk on the streets in Mexico. Keep it natural, do not overdo it.' },
 }
 local langLabels = {}
 for i, l in ipairs(LANGS) do langLabels[i] = l.label end
@@ -71,8 +78,8 @@ local cfg = {
     min_letters      = 3,
     gemini_key       = '',
     gemini_model     = 'gemini-3.5-flash-lite',
-    grok_key         = '',
-    grok_model       = 'grok-4-1-fast-non-reasoning',
+    groq_key         = '',
+    groq_model       = 'llama-3.3-70b-versatile',
     gemini_cooldown  = 300,     -- detik Gemini diistirahatkan setelah limit/kuota habis
 }
 
@@ -89,7 +96,7 @@ local function loadCfg()
         end
     end
     cfg.gemini_key = cfg.gemini_key:gsub('%s', '')
-    cfg.grok_key = cfg.grok_key:gsub('%s', '')
+    cfg.groq_key = cfg.groq_key:gsub('%s', '')
     if not LANGS[cfg.out_lang] then cfg.out_lang = 2 end
     if not LANGS[cfg.in_lang] then cfg.in_lang = 1 end
 end
@@ -133,9 +140,18 @@ local UNICODE_FIX = {
     ['\226\128\147'] = '-', ['\226\128\148'] = '-',
     ['\194\160'] = ' ',
 }
+-- huruf beraksen Latin (U+00C0..U+00FF) -> huruf biasa, karena chat SA-MP (CP1251) tidak punya
+local LATIN1 = {
+    'A','A','A','A','A','A','AE','C','E','E','E','E','I','I','I','I',
+    'D','N','O','O','O','O','O','x','O','U','U','U','U','Y','Th','ss',
+    'a','a','a','a','a','a','ae','c','e','e','e','e','i','i','i','i',
+    'd','n','o','o','o','o','o','/','o','u','u','u','u','y','th','y',
+}
 local function toGame(s)
     s = s:gsub('[\r\n]+', ' ')
     for k, v in pairs(UNICODE_FIX) do s = s:gsub(k, v) end
+    s = s:gsub('\195([\128-\191])', function(c) return LATIN1[c:byte() - 127] end) -- ñ -> n, á -> a, dst
+    s = s:gsub('\194[\161\191\176\170\186]', '') -- buang ¡ ¿ ° ª º
     s = trim(s)
     -- buang tanda kutip pembungkus kalau AI menambahkannya
     if #s >= 2 and s:sub(1, 1) == '"' and s:sub(-1) == '"' then s = trim(s:sub(2, -2)) end
@@ -262,22 +278,22 @@ local function callGemini(system, text, cb)
     end)
 end
 
-local function callGrok(system, text, cb)
+local function callGroq(system, text, cb)
     local body = encodeJson({
-        model = cfg.grok_model,
+        model = cfg.groq_model,
         messages = {
             { role = 'system', content = system },
             { role = 'user', content = text },
         },
     })
-    httpPost('https://api.x.ai/v1/chat/completions', body, 'Authorization', 'Bearer ' .. cfg.grok_key, function(ok, code, resp)
+    httpPost('https://api.groq.com/openai/v1/chat/completions', body, 'Authorization', 'Bearer ' .. cfg.groq_key, function(ok, code, resp)
         if not ok then return cb(false, resp, code) end
         if code ~= 200 then return cb(false, apiErrorText(code, resp), code) end
         local okj, j = pcall(decodeJson, resp)
-        if not okj or type(j) ~= 'table' then return cb(false, 'respon Grok tidak valid', code) end
+        if not okj or type(j) ~= 'table' then return cb(false, 'respon Groq tidak valid', code) end
         local msg = j.choices and j.choices[1] and j.choices[1].message
         local result = msg and msg.content and trim(tostring(msg.content)) or ''
-        if result == '' then return cb(false, 'jawaban Grok kosong', code) end
+        if result == '' then return cb(false, 'jawaban Groq kosong', code) end
         cb(true, result, code)
     end)
 end
@@ -287,17 +303,17 @@ local function callProvider(name, system, text, cb)
         if cfg.gemini_key == '' then return cb(false, 'API key Gemini kosong', 0) end
         callGemini(system, text, cb)
     else
-        if cfg.grok_key == '' then return cb(false, 'API key Grok kosong', 0) end
-        callGrok(system, text, cb)
+        if cfg.groq_key == '' then return cb(false, 'API key Groq kosong', 0) end
+        callGroq(system, text, cb)
     end
 end
 
--- Gemini dulu; kalau gagal/habis -> langsung Grok
+-- Gemini dulu; kalau gagal/habis -> langsung Groq
 local function translate(system, text, cb)
     local order = {}
     local geminiReady = os.time() >= state.geminiBlockedUntil
     if cfg.gemini_key ~= '' and geminiReady then order[#order + 1] = 'gemini' end
-    if cfg.grok_key ~= '' then order[#order + 1] = 'grok' end
+    if cfg.groq_key ~= '' then order[#order + 1] = 'groq' end
     if #order == 0 and cfg.gemini_key ~= '' then order[1] = 'gemini' end -- tidak ada cadangan, coba saja
     if #order == 0 then return cb(false, 'belum ada API key (isi di /str > API)') end
 
@@ -330,19 +346,25 @@ end
 local SAME = '__SAME__'
 
 local function promptOut()
-    local lang = LANGS[cfg.out_lang].name
-    return 'You translate chat messages for an online GTA San Andreas Multiplayer (SA-MP) roleplay server. '
-        .. 'Translate the user message into ' .. lang .. '. Keep the meaning, casual tone, slang and player names. '
-        .. 'If the message is already in ' .. lang .. ', return it unchanged. '
-        .. 'Reply with ONLY the translated text on a single line: no quotes, no notes, no explanations.'
+    local L = LANGS[cfg.out_lang]
+    local p = 'You translate chat messages for an online GTA San Andreas Multiplayer (SA-MP) roleplay server. '
+        .. 'Translate the user message into ' .. L.name .. '. Keep the meaning and player names. '
+    if L.style then
+        p = p .. L.style .. ' If the message is already in ' .. L.name .. ', rewrite it in that style. '
+    else
+        p = p .. 'Keep the casual tone and slang. If the message is already in ' .. L.name .. ', return it unchanged. '
+    end
+    return p .. 'Reply with ONLY the translated text on a single line: no quotes, no notes, no explanations.'
 end
 
 local function promptIn()
-    local lang = LANGS[cfg.in_lang].name
-    return 'You translate chat messages from other players on an online GTA San Andreas Multiplayer (SA-MP) roleplay server. '
-        .. 'If the message is already written in ' .. lang .. ', or it has no real words to translate, reply with exactly ' .. SAME .. '. '
-        .. 'Otherwise translate it into ' .. lang .. ' with a casual, natural tone, keeping player names. '
-        .. 'Reply with ONLY the translation on a single line: no quotes, no notes, no explanations.'
+    local L = LANGS[cfg.in_lang]
+    local p = 'You translate chat messages from other players on an online GTA San Andreas Multiplayer (SA-MP) roleplay server. '
+        .. 'Other players may use street slang from any country (American, Mexican, etc.); understand the slang and translate its real meaning. '
+        .. 'If the message is already written in ' .. L.name .. ', or it has no real words to translate, reply with exactly ' .. SAME .. '. '
+        .. 'Otherwise translate it into ' .. L.name .. ' with a casual, natural tone, keeping player names. '
+    if L.style then p = p .. L.style .. ' ' end
+    return p .. 'Reply with ONLY the translation on a single line: no quotes, no notes, no explanations.'
 end
 
 -- =========================================================================
@@ -494,8 +516,8 @@ local ui = {
     cmd_list        = new.char[128](cfg.cmd_list),
     gemini_key      = new.char[256](cfg.gemini_key),
     gemini_model    = new.char[96](cfg.gemini_model),
-    grok_key        = new.char[256](cfg.grok_key),
-    grok_model      = new.char[96](cfg.grok_model),
+    groq_key        = new.char[256](cfg.groq_key),
+    groq_model      = new.char[96](cfg.groq_model),
     show_keys       = new.bool(false),
     test_text       = new.char[256]('di sana ada polisi'),
     test_in_text    = new.char[256]("Just relax, there's only one police officer there"),
@@ -578,7 +600,7 @@ end)
 
 imgui.OnFrame(function() return ui.show[0] end, function()
     imgui.SetNextWindowSize(imgui.ImVec2(560, 500), imgui.Cond.FirstUseEver)
-    imgui.Begin('STR Translator  (Gemini -> Grok)', ui.show)
+    imgui.Begin('STR Translator  (Gemini -> Groq)', ui.show)
 
     -- status singkat
     if cfg.enabled then colored(0.4, 1, 0.4, 'Status: AKTIF') else colored(1, 0.4, 0.4, 'Status: MATI') end
@@ -586,7 +608,7 @@ imgui.OnFrame(function() return ui.show[0] end, function()
     imgui.TextUnformatted('  |  Terakhir dipakai: ' .. state.lastProvider)
     local left = state.geminiBlockedUntil - os.time()
     if left > 0 then
-        colored(1, 0.8, 0.3, ('Gemini istirahat %d detik lagi (kuota/limit) -> pakai Grok'):format(left))
+        colored(1, 0.8, 0.3, ('Gemini istirahat %d detik lagi (kuota/limit) -> pakai Groq'):format(left))
     end
     imgui.Separator()
 
@@ -637,12 +659,12 @@ imgui.OnFrame(function() return ui.show[0] end, function()
             imgui.SetNextItemWidth(250)
             inputText('Model Gemini', 'gemini_model')
             imgui.Spacing()
-            colored(0.5, 0.8, 1, 'Grok (cadangan saat Gemini habis/gagal)')
+            colored(0.5, 0.8, 1, 'Groq (cadangan saat Gemini habis/gagal)')
             imgui.SetNextItemWidth(380)
-            inputText('API key Grok', 'grok_key', keyFlags)
-            keyInfo('grok_key', 'xai-')
+            inputText('API key Groq', 'groq_key', keyFlags)
+            keyInfo('groq_key', 'gsk_')
             imgui.SetNextItemWidth(250)
-            inputText('Model Grok', 'grok_model')
+            inputText('Model Groq', 'groq_model')
             imgui.Spacing()
             imgui.Checkbox('Tampilkan API key', ui.show_keys)
             imgui.SetNextItemWidth(120)
@@ -675,14 +697,14 @@ imgui.OnFrame(function() return ui.show[0] end, function()
                 end)
             end
             imgui.SameLine()
-            if imgui.Button('Test Grok') then
+            if imgui.Button('Test Groq') then
                 local t = ffistr(ui.test_text)
-                runTest('Grok', function(done)
-                    callProvider('grok', promptOut(), t, function(ok, r) done(ok, r, 'grok') end)
+                runTest('Groq', function(done)
+                    callProvider('groq', promptOut(), t, function(ok, r) done(ok, r, 'groq') end)
                 end)
             end
             imgui.SameLine()
-            if imgui.Button('Test otomatis (Gemini -> Grok)') then
+            if imgui.Button('Test otomatis (Gemini -> Groq)') then
                 local t = ffistr(ui.test_text)
                 runTest('Keluar -> ' .. LANGS[cfg.out_lang].label, function(done) translate(promptOut(), t, done) end)
             end
@@ -739,7 +761,7 @@ function main()
     ui.in_lang[0]          = cfg.in_lang - 1
     ui.min_letters[0]      = cfg.min_letters
     ui.cooldown[0]         = cfg.gemini_cooldown
-    for _, k in ipairs({ 'raw_prefix', 'cmd_list', 'gemini_key', 'gemini_model', 'grok_key', 'grok_model' }) do
+    for _, k in ipairs({ 'raw_prefix', 'cmd_list', 'gemini_key', 'gemini_model', 'groq_key', 'groq_model' }) do
         ffi.copy(ui[k], cfg[k]:sub(1, sizeof(ui[k]) - 1))
     end
 
@@ -769,7 +791,7 @@ function main()
     if not state.libs.requests or not state.libs.ssl or not state.libs.effil then
         notify('{FF6666}Library kurang (effil / requests / ssl). Cek tab Test di /str.')
     end
-    if cfg.gemini_key == '' and cfg.grok_key == '' then
+    if cfg.gemini_key == '' and cfg.groq_key == '' then
         notify('Belum ada API key. Isi dulu di {FFFF99}/str{FFFFFF} > tab API.')
     end
 
