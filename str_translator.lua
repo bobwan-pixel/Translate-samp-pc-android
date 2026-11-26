@@ -12,9 +12,9 @@
       - mimgui
       - effil
       - lua-requests (requests) + luasocket + luasec (ssl)  -> untuk HTTPS
+      - encoding
 
     API: Gemini (aistudio.google.com) dan Groq (console.groq.com, key diawali gsk_)
-      - encoding
 ]]
 
 script_name('STR Translator')
