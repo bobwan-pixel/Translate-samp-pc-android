@@ -98,7 +98,7 @@ local function loadCfg()
     cfg.gemini_key = cfg.gemini_key:gsub('%s', '')
     cfg.groq_key = cfg.groq_key:gsub('%s', '')
     -- model Groq lama yang sudah dimatikan -> ganti otomatis
-    local deadGroq = { ['llama-3.3-70b-versatile'] = true, ['llama-3.1-8b-instant'] = true,
+    local deadGroq = { ['llama-3.3-70b-versatile'] = false, ['llama-3.1-8b-instant'] = true,
                        ['qwen/qwen3-32b'] = true, ['meta-llama/llama-4-scout-17b-16e-instruct'] = true }
     if deadGroq[cfg.groq_model] then cfg.groq_model = 'openai/gpt-oss-120b' end
     if not LANGS[cfg.out_lang] then cfg.out_lang = 2 end
