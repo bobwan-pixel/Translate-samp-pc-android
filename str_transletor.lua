@@ -6,15 +6,6 @@
       /str        buka / tutup menu
       /str on     nyalakan penerjemah
       /str off    matikan penerjemah  (/str of juga bisa)
-
-    Kebutuhan (taruh di folder moonloader/lib):
-      - SAMP.Lua (lib.samp.events)
-      - mimgui
-      - effil
-      - lua-requests (requests) + luasocket + luasec (ssl)  -> untuk HTTPS
-      - encoding
-
-    API: Gemini (aistudio.google.com) dan Groq (console.groq.com, key diawali gsk_)
 ]]
 
 script_name('STR Translator')
@@ -912,7 +903,7 @@ function main()
         end
     end)
 
-    notify('Loaded. Ketik {FFFF99}/str{FFFFFF} untuk menu, {FFFF99}/str on{FFFFFF} / {FFFF99}/str off{FFFFFF}.')
+    notify('Loaded. Ketik {FFFF99}/str{FFFFFF} untuk menu, {FFFF99}/str on{FFFFFF} / {FFFF99}/str off{FFFFFF} CopyRight By:Bobwan.')
     if not state.libs.requests or not state.libs.ssl or not state.libs.effil then
         notify('{FF6666}Library kurang (effil / requests / ssl). Cek tab Test di /str.')
     end
