@@ -79,7 +79,7 @@ local cfg = {
     gemini_key       = '',
     gemini_model     = 'gemini-3.5-flash-lite',
     groq_key         = '',
-    groq_model       = 'llama-3.3-70b-versatile',
+    groq_model       = 'openai/gpt-oss-120b',
     gemini_cooldown  = 300,     -- detik Gemini diistirahatkan setelah limit/kuota habis
 }
 
@@ -97,6 +97,10 @@ local function loadCfg()
     end
     cfg.gemini_key = cfg.gemini_key:gsub('%s', '')
     cfg.groq_key = cfg.groq_key:gsub('%s', '')
+    -- model Groq lama yang sudah dimatikan -> ganti otomatis
+    local deadGroq = { ['llama-3.3-70b-versatile'] = true, ['llama-3.1-8b-instant'] = true,
+                       ['qwen/qwen3-32b'] = true, ['meta-llama/llama-4-scout-17b-16e-instruct'] = true }
+    if deadGroq[cfg.groq_model] then cfg.groq_model = 'openai/gpt-oss-120b' end
     if not LANGS[cfg.out_lang] then cfg.out_lang = 2 end
     if not LANGS[cfg.in_lang] then cfg.in_lang = 1 end
 end
@@ -279,13 +283,16 @@ local function callGemini(system, text, cb)
 end
 
 local function callGroq(system, text, cb)
-    local body = encodeJson({
+    local req = {
         model = cfg.groq_model,
         messages = {
             { role = 'system', content = system },
             { role = 'user', content = text },
         },
-    })
+    }
+    -- model gpt-oss "berpikir" dulu; dibuat singkat supaya terjemahan cepat
+    if cfg.groq_model:find('gpt%-oss') then req.reasoning_effort = 'low' end
+    local body = encodeJson(req)
     httpPost('https://api.groq.com/openai/v1/chat/completions', body, 'Authorization', 'Bearer ' .. cfg.groq_key, function(ok, code, resp)
         if not ok then return cb(false, resp, code) end
         if code ~= 200 then return cb(false, apiErrorText(code, resp), code) end
