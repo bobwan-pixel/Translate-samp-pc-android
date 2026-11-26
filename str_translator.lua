@@ -81,6 +81,7 @@ local cfg = {
     groq_key         = '',
     groq_model       = 'openai/gpt-oss-120b',
     gemini_cooldown  = 300,     -- detik Gemini diistirahatkan setelah limit/kuota habis
+    debug            = false,   -- tampilkan jawaban mentah AI di chat
 }
 
 local function loadCfg()
@@ -156,6 +157,10 @@ local function toGame(s)
     for k, v in pairs(UNICODE_FIX) do s = s:gsub(k, v) end
     s = s:gsub('\195([\128-\191])', function(c) return LATIN1[c:byte() - 127] end) -- ñ -> n, á -> a, dst
     s = s:gsub('\194[\161\191\176\170\186]', '') -- buang ¡ ¿ ° ª º
+    s = s:gsub('[\240-\244][\128-\191][\128-\191][\128-\191]', '') -- buang emoji
+    s = s:gsub('[\224-\239][\128-\191][\128-\191]', '') -- simbol lain (hati, bintang, zero-width) yang tidak bisa tampil
+    s = s:gsub('[%z\1-\31\127]', '') -- karakter kontrol
+    s = s:gsub('%s%s+', ' ')
     s = trim(s)
     -- buang tanda kutip pembungkus kalau AI menambahkannya
     if #s >= 2 and s:sub(1, 1) == '"' and s:sub(-1) == '"' then s = trim(s:sub(2, -2)) end
@@ -199,7 +204,7 @@ local function httpRequest(method, url, body, headerName, headerValue, cb)
         local requests = require 'requests'
         local headers = { ['Content-Type'] = 'application/json' }
         headers[headerName] = headerValue
-        local args = { headers = headers, timeout = 25 }
+        local args = { headers = headers, timeout = 10 }
         if body ~= '' then args.data = body end
         local ok, res = pcall(requests.request, method, url, args)
         if not ok then return false, 0, tostring(res) end
@@ -415,7 +420,7 @@ local function promptOut()
     else
         p = p .. 'Keep the casual tone and slang. If the message is already in ' .. L.name .. ', return it unchanged. '
     end
-    return p .. 'Reply with ONLY the translated text on a single line: no quotes, no notes, no explanations.'
+    return p .. 'Reply with ONLY the translated text on a single line: no quotes, no emojis, no notes, no explanations.'
 end
 
 local function promptIn()
@@ -425,7 +430,7 @@ local function promptIn()
         .. 'If the message is already written in ' .. L.name .. ', or it has no real words to translate, reply with exactly ' .. SAME .. '. '
         .. 'Otherwise translate it into ' .. L.name .. ' with a casual, natural tone, keeping player names. '
     if L.style then p = p .. L.style .. ' ' end
-    return p .. 'Reply with ONLY the translation on a single line: no quotes, no notes, no explanations.'
+    return p .. 'Reply with ONLY the translation on a single line: no quotes, no emojis, no notes, no explanations.'
 end
 
 -- =========================================================================
@@ -442,20 +447,55 @@ end
 -- =========================================================================
 -- Antrian pesan keluar (berurutan supaya urutan chat tidak acak)
 -- =========================================================================
+local QUEUE_TIMEOUT = 22 -- detik; lewat dari ini pesan asli dikirim supaya antrian tidak macet
+
+local function safeGame(s)
+    local ok, r = pcall(toGame, tostring(s))
+    return ok and r or '?'
+end
+
 local function processOut()
     if state.busyOut or #state.outQueue == 0 then return end
     state.busyOut = true
     local item = table.remove(state.outQueue, 1)
-    translate(promptOut(), toUtf8(item.text), function(ok, result)
-        if ok then
-            sendRaw(item.prefix .. toGame(result))
-        else
-            notify('{FF6666}Gagal menerjemahkan, pesan asli dikirim. {AAAAAA}' .. toGame(tostring(result)):sub(1, 90))
-            sendRaw(item.prefix .. item.text)
-        end
+    local original = item.prefix .. item.text
+    local done = false
+
+    -- apa pun yang terjadi, fungsi ini SELALU membuka antrian lagi
+    local function finish(text, warn)
+        if done then return end
+        done = true
+        if warn then pcall(notify, warn) end
+        local okSend, errSend = pcall(sendRaw, text)
+        if not okSend then pcall(notify, '{FF6666}Gagal kirim chat: ' .. tostring(errSend)) end
         state.busyOut = false
         processOut()
+    end
+
+    -- pengaman: AI terlalu lama / tidak menjawab -> kirim pesan asli
+    lua_thread.create(function()
+        wait(QUEUE_TIMEOUT * 1000)
+        finish(original, '{FF6666}AI terlalu lama menjawab, pesan asli dikirim.')
     end)
+
+    local okCall, errCall = pcall(translate, promptOut(), toUtf8(item.text), function(ok, result)
+        if done then return end
+        if not ok then
+            return finish(original, '{FF6666}Gagal menerjemahkan, pesan asli dikirim. {AAAAAA}' .. safeGame(result):sub(1, 90))
+        end
+        if cfg.debug then pcall(notify, '{AAAAAA}AI: ' .. safeGame(result):sub(1, 110)) end
+        local okConv, out = pcall(toGame, result)
+        if not okConv then
+            return finish(original, '{FF6666}Error script: ' .. tostring(out):sub(1, 90) .. ' - pesan asli dikirim.')
+        end
+        if countLetters(out) == 0 then
+            return finish(original, '{FF6666}Jawaban AI kosong setelah dibersihkan, pesan asli dikirim.')
+        end
+        finish(item.prefix .. out)
+    end)
+    if not okCall then
+        finish(original, '{FF6666}Error script: ' .. tostring(errCall):sub(1, 90) .. ' - pesan asli dikirim.')
+    end
 end
 
 local function queueOut(prefix, text)
@@ -470,13 +510,29 @@ local function processIn()
     if state.busyIn or #state.inQueue == 0 then return end
     state.busyIn = true
     local item = table.remove(state.inQueue, 1)
-    translate(promptIn(), toUtf8(item.text), function(ok, result)
-        if ok and not result:find(SAME, 1, true) then
-            sampAddChatMessage(('{66CCFF}[STR] {FFFF99}%s{FFFFFF}: %s'):format(item.name, toGame(result)), -1)
-        end
+    local done = false
+    local function finish()
+        if done then return end
+        done = true
         state.busyIn = false
         processIn()
+    end
+    lua_thread.create(function()
+        wait(QUEUE_TIMEOUT * 1000)
+        finish()
     end)
+    local okCall = pcall(translate, promptIn(), toUtf8(item.text), function(ok, result)
+        if done then return end
+        if ok and not result:find(SAME, 1, true) then
+            pcall(function()
+                sampAddChatMessage(('{66CCFF}[STR] {FFFF99}%s{FFFFFF}: %s'):format(item.name, toGame(result)), -1)
+            end)
+        elseif not ok and cfg.debug then
+            pcall(notify, '{AAAAAA}Gagal terjemah pesan masuk: ' .. safeGame(result):sub(1, 90))
+        end
+        finish()
+    end)
+    if not okCall then finish() end
 end
 
 local function queueIn(name, text)
@@ -569,6 +625,7 @@ local ui = {
     translate_in    = new.bool(cfg.translate_in),
     translate_server= new.bool(cfg.translate_server),
     translate_cmds  = new.bool(cfg.translate_cmds),
+    debug           = new.bool(cfg.debug),
     out_lang        = new.int(cfg.out_lang - 1),
     in_lang         = new.int(cfg.in_lang - 1),
     min_letters     = new.int(cfg.min_letters),
@@ -706,6 +763,8 @@ imgui.OnFrame(function() return ui.show[0] end, function()
             imgui.SetNextItemWidth(60)
             inputText('Awalan kirim tanpa terjemah', 'raw_prefix')
             wrapped('Contoh: ketik ".halo" -> terkirim "halo" tanpa diterjemahkan.')
+            imgui.Spacing()
+            checkbox('Mode debug (tampilkan jawaban AI di chat)', 'debug')
             imgui.Spacing()
             checkbox('Terjemahkan juga perintah ini:', 'translate_cmds')
             imgui.SetNextItemWidth(250)
@@ -846,6 +905,7 @@ function main()
     ui.translate_in[0]     = cfg.translate_in
     ui.translate_server[0] = cfg.translate_server
     ui.translate_cmds[0]   = cfg.translate_cmds
+    ui.debug[0]            = cfg.debug
     ui.out_lang[0]         = cfg.out_lang - 1
     ui.in_lang[0]          = cfg.in_lang - 1
     ui.min_letters[0]      = cfg.min_letters
