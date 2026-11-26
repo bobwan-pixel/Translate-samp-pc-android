@@ -1,0 +1,754 @@
+--[[
+    STR Translator - MoonLoader (SA-MP)
+    Penerjemah chat otomatis pakai AI: Gemini (utama) -> Grok (cadangan).
+
+    Perintah:
+      /str        buka / tutup menu
+      /str on     nyalakan penerjemah
+      /str off    matikan penerjemah  (/str of juga bisa)
+
+    Kebutuhan (taruh di folder moonloader/lib):
+      - SAMP.Lua (lib.samp.events)
+      - mimgui
+      - effil
+      - lua-requests (requests) + luasocket + luasec (ssl)  -> untuk HTTPS
+      - encoding
+]]
+
+script_name('STR Translator')
+script_author('bobwan-pixel')
+script_version('1.0')
+
+require 'lib.moonloader'
+local sampev   = require 'lib.samp.events'
+local imgui    = require 'mimgui'
+local encoding = require 'encoding'
+local effil    = require 'effil'
+local ffi      = require 'ffi'
+
+encoding.default = 'CP1251'
+local u8 = encoding.UTF8
+
+local new, ffistr, sizeof = imgui.new, ffi.string, ffi.sizeof
+
+-- =========================================================================
+-- Bahasa
+-- =========================================================================
+local LANGS = {
+    { label = 'Indonesia',        name = 'Indonesian' },
+    { label = 'Inggris',          name = 'English' },
+    { label = 'Melayu',           name = 'Malay' },
+    { label = 'Filipina',         name = 'Filipino (Tagalog)' },
+    { label = 'Spanyol',          name = 'Spanish' },
+    { label = 'Portugis',         name = 'Portuguese' },
+    { label = 'Prancis',          name = 'French' },
+    { label = 'Jerman',           name = 'German' },
+    { label = 'Italia',           name = 'Italian' },
+    { label = 'Belanda',          name = 'Dutch' },
+    { label = 'Turki',            name = 'Turkish' },
+    { label = 'Polandia',         name = 'Polish' },
+    { label = 'Rusia',            name = 'Russian' },
+}
+local langLabels = {}
+for i, l in ipairs(LANGS) do langLabels[i] = l.label end
+
+-- =========================================================================
+-- Konfigurasi
+-- =========================================================================
+local CFG_DIR  = getWorkingDirectory() .. '\\config'
+local CFG_PATH = CFG_DIR .. '\\str_translator.json'
+
+local cfg = {
+    enabled          = true,
+    translate_out    = true,    -- terjemahkan pesan yang aku ketik
+    translate_in     = true,    -- terjemahkan pesan lawan bicara
+    translate_server = true,    -- baca chat dari pesan server (format "Nama says: ...")
+    translate_cmds   = false,   -- terjemahkan juga perintah seperti /b /s /low
+    cmd_list         = 'b,s,low,shout,me,do',
+    out_lang         = 2,       -- index LANGS (1-based) -> Inggris
+    in_lang          = 1,       -- index LANGS (1-based) -> Indonesia
+    raw_prefix       = '.',     -- awali pesan dengan ini untuk kirim TANPA diterjemahkan
+    min_letters      = 3,
+    gemini_key       = '',
+    gemini_model     = 'gemini-3.5-flash-lite',
+    grok_key         = '',
+    grok_model       = 'grok-4-1-fast-non-reasoning',
+    gemini_cooldown  = 300,     -- detik Gemini diistirahatkan setelah limit/kuota habis
+}
+
+local function loadCfg()
+    if not doesFileExist(CFG_PATH) then return end
+    local f = io.open(CFG_PATH, 'r')
+    if not f then return end
+    local raw = f:read('*a')
+    f:close()
+    local ok, t = pcall(decodeJson, raw)
+    if ok and type(t) == 'table' then
+        for k, v in pairs(t) do
+            if cfg[k] ~= nil and type(v) == type(cfg[k]) then cfg[k] = v end
+        end
+    end
+    if not LANGS[cfg.out_lang] then cfg.out_lang = 2 end
+    if not LANGS[cfg.in_lang] then cfg.in_lang = 1 end
+end
+
+local function saveCfg()
+    if not doesDirectoryExist(CFG_DIR) then createDirectory(CFG_DIR) end
+    local f = io.open(CFG_PATH, 'w')
+    if f then
+        f:write(encodeJson(cfg))
+        f:close()
+    end
+end
+
+local dirty = false
+local function markDirty() dirty = true end
+
+-- =========================================================================
+-- Utilitas
+-- =========================================================================
+local TAG = '{66CCFF}[STR]{FFFFFF} '
+
+local function notify(text)
+    sampAddChatMessage(TAG .. text, -1)
+end
+
+local function trim(s)
+    return (s:gsub('^%s+', ''):gsub('%s+$', ''))
+end
+
+local function countLetters(s)
+    local n = 0
+    for _ in s:gmatch('%a') do n = n + 1 end
+    return n
+end
+
+-- Ubah teks UTF-8 dari AI menjadi teks yang aman untuk chat SA-MP (CP1251)
+local UNICODE_FIX = {
+    ['\226\128\152'] = "'", ['\226\128\153'] = "'",
+    ['\226\128\156'] = '"', ['\226\128\157'] = '"',
+    ['\226\128\166'] = '...',
+    ['\226\128\147'] = '-', ['\226\128\148'] = '-',
+    ['\194\160'] = ' ',
+}
+local function toGame(s)
+    s = s:gsub('[\r\n]+', ' ')
+    for k, v in pairs(UNICODE_FIX) do s = s:gsub(k, v) end
+    s = trim(s)
+    -- buang tanda kutip pembungkus kalau AI menambahkannya
+    if #s >= 2 and s:sub(1, 1) == '"' and s:sub(-1) == '"' then s = trim(s:sub(2, -2)) end
+    local ok, r = pcall(u8.decode, u8, s)
+    if ok and type(r) == 'string' and r ~= '' then return r end
+    return (s:gsub('[\128-\255]', ''))
+end
+
+local function toUtf8(s)
+    local ok, r = pcall(u8, s)
+    if ok and type(r) == 'string' then return r end
+    return s
+end
+
+local function myName()
+    local ok, res, id = pcall(sampGetPlayerIdByCharHandle, PLAYER_PED)
+    if ok and res then
+        local ok2, nick = pcall(sampGetPlayerNickname, id)
+        if ok2 then return nick end
+    end
+    return nil
+end
+
+local function isConnectedPlayer(name)
+    name = name:gsub(' ', '_'):lower()
+    for i = 0, 1003 do
+        if sampIsPlayerConnected(i) then
+            local nick = sampGetPlayerNickname(i)
+            if nick and nick:lower() == name then return true end
+        end
+    end
+    local me = myName()
+    return me ~= nil and me:lower() == name
+end
+
+-- =========================================================================
+-- HTTP async (effil thread + lua-requests)
+-- =========================================================================
+local function httpPost(url, body, headerName, headerValue, cb)
+    local runner = effil.thread(function(url, body, headerName, headerValue)
+        local requests = require 'requests'
+        local headers = { ['Content-Type'] = 'application/json' }
+        headers[headerName] = headerValue
+        local ok, res = pcall(requests.post, url, { headers = headers, data = body, timeout = 25 })
+        if not ok then return false, 0, tostring(res) end
+        return true, tonumber(res.status_code) or 0, tostring(res.text or '')
+    end)(url, body, headerName, headerValue)
+
+    lua_thread.create(function()
+        while true do
+            local status, err = runner:status()
+            if err then return cb(false, 0, 'thread error: ' .. tostring(err)) end
+            if status == 'completed' then
+                local ok, code, text = runner:get()
+                return cb(ok, code, text)
+            elseif status == 'canceled' or status == 'failed' then
+                return cb(false, 0, 'thread ' .. tostring(status))
+            end
+            wait(0)
+        end
+    end)
+end
+
+local function apiErrorText(code, text)
+    local ok, j = pcall(decodeJson, text)
+    if ok and type(j) == 'table' then
+        if type(j.error) == 'table' and j.error.message then
+            return ('HTTP %d: %s'):format(code, tostring(j.error.message))
+        elseif type(j.error) == 'string' then
+            return ('HTTP %d: %s'):format(code, j.error)
+        end
+    end
+    return ('HTTP %d: %s'):format(code, (text or ''):sub(1, 150))
+end
+
+-- =========================================================================
+-- Provider AI
+-- =========================================================================
+local state = {
+    geminiBlockedUntil = 0,
+    lastProvider = '-',
+    lastError = '',
+    outQueue = {},
+    inQueue = {},
+    busyOut = false,
+    busyIn = false,
+    recent = {},
+    libs = {},
+}
+
+local function callGemini(system, text, cb)
+    local url = 'https://generativelanguage.googleapis.com/v1beta/models/' .. cfg.gemini_model .. ':generateContent'
+    local body = encodeJson({
+        systemInstruction = { parts = { { text = system } } },
+        contents = { { role = 'user', parts = { { text = text } } } },
+    })
+    httpPost(url, body, 'x-goog-api-key', cfg.gemini_key, function(ok, code, resp)
+        if not ok then return cb(false, resp, code) end
+        if code ~= 200 then return cb(false, apiErrorText(code, resp), code) end
+        local okj, j = pcall(decodeJson, resp)
+        if not okj or type(j) ~= 'table' then return cb(false, 'respon Gemini tidak valid', code) end
+        local cand = j.candidates and j.candidates[1]
+        local parts = cand and cand.content and cand.content.parts
+        if type(parts) ~= 'table' then
+            local reason = (j.promptFeedback and j.promptFeedback.blockReason) or (cand and cand.finishReason) or 'kosong'
+            return cb(false, 'Gemini tidak memberi jawaban (' .. tostring(reason) .. ')', code)
+        end
+        local out = {}
+        for _, p in ipairs(parts) do
+            if p.text and not p.thought then out[#out + 1] = p.text end
+        end
+        local result = trim(table.concat(out, ' '))
+        if result == '' then return cb(false, 'jawaban Gemini kosong', code) end
+        cb(true, result, code)
+    end)
+end
+
+local function callGrok(system, text, cb)
+    local body = encodeJson({
+        model = cfg.grok_model,
+        messages = {
+            { role = 'system', content = system },
+            { role = 'user', content = text },
+        },
+    })
+    httpPost('https://api.x.ai/v1/chat/completions', body, 'Authorization', 'Bearer ' .. cfg.grok_key, function(ok, code, resp)
+        if not ok then return cb(false, resp, code) end
+        if code ~= 200 then return cb(false, apiErrorText(code, resp), code) end
+        local okj, j = pcall(decodeJson, resp)
+        if not okj or type(j) ~= 'table' then return cb(false, 'respon Grok tidak valid', code) end
+        local msg = j.choices and j.choices[1] and j.choices[1].message
+        local result = msg and msg.content and trim(tostring(msg.content)) or ''
+        if result == '' then return cb(false, 'jawaban Grok kosong', code) end
+        cb(true, result, code)
+    end)
+end
+
+local function callProvider(name, system, text, cb)
+    if name == 'gemini' then
+        if cfg.gemini_key == '' then return cb(false, 'API key Gemini kosong', 0) end
+        callGemini(system, text, cb)
+    else
+        if cfg.grok_key == '' then return cb(false, 'API key Grok kosong', 0) end
+        callGrok(system, text, cb)
+    end
+end
+
+-- Gemini dulu; kalau gagal/habis -> langsung Grok
+local function translate(system, text, cb)
+    local order = {}
+    local geminiReady = os.time() >= state.geminiBlockedUntil
+    if cfg.gemini_key ~= '' and geminiReady then order[#order + 1] = 'gemini' end
+    if cfg.grok_key ~= '' then order[#order + 1] = 'grok' end
+    if #order == 0 and cfg.gemini_key ~= '' then order[1] = 'gemini' end -- tidak ada cadangan, coba saja
+    if #order == 0 then return cb(false, 'belum ada API key (isi di /str > API)') end
+
+    local i, errors = 0, {}
+    local function try()
+        i = i + 1
+        local p = order[i]
+        if not p then
+            state.lastError = table.concat(errors, ' | ')
+            return cb(false, state.lastError)
+        end
+        callProvider(p, system, text, function(ok, result, code)
+            if ok then
+                state.lastProvider = p
+                return cb(true, result, p)
+            end
+            if p == 'gemini' and (code == 429 or code == 403) then
+                state.geminiBlockedUntil = os.time() + cfg.gemini_cooldown
+            end
+            errors[#errors + 1] = p .. ': ' .. tostring(result)
+            try()
+        end)
+    end
+    try()
+end
+
+-- =========================================================================
+-- Prompt
+-- =========================================================================
+local SAME = '__SAME__'
+
+local function promptOut()
+    local lang = LANGS[cfg.out_lang].name
+    return 'You translate chat messages for an online GTA San Andreas Multiplayer (SA-MP) roleplay server. '
+        .. 'Translate the user message into ' .. lang .. '. Keep the meaning, casual tone, slang and player names. '
+        .. 'If the message is already in ' .. lang .. ', return it unchanged. '
+        .. 'Reply with ONLY the translated text on a single line: no quotes, no notes, no explanations.'
+end
+
+local function promptIn()
+    local lang = LANGS[cfg.in_lang].name
+    return 'You translate chat messages from other players on an online GTA San Andreas Multiplayer (SA-MP) roleplay server. '
+        .. 'If the message is already written in ' .. lang .. ', or it has no real words to translate, reply with exactly ' .. SAME .. '. '
+        .. 'Otherwise translate it into ' .. lang .. ' with a casual, natural tone, keeping player names. '
+        .. 'Reply with ONLY the translation on a single line: no quotes, no notes, no explanations.'
+end
+
+-- =========================================================================
+-- Kirim chat tanpa dicegat ulang
+-- =========================================================================
+local bypass = false
+local function sendRaw(text)
+    if #text > 143 then text = text:sub(1, 143) end
+    bypass = true
+    sampSendChat(text)
+    bypass = false
+end
+
+-- =========================================================================
+-- Antrian pesan keluar (berurutan supaya urutan chat tidak acak)
+-- =========================================================================
+local function processOut()
+    if state.busyOut or #state.outQueue == 0 then return end
+    state.busyOut = true
+    local item = table.remove(state.outQueue, 1)
+    translate(promptOut(), toUtf8(item.text), function(ok, result)
+        if ok then
+            sendRaw(item.prefix .. toGame(result))
+        else
+            notify('{FF6666}Gagal menerjemahkan, pesan asli dikirim. {AAAAAA}' .. toGame(tostring(result)):sub(1, 90))
+            sendRaw(item.prefix .. item.text)
+        end
+        state.busyOut = false
+        processOut()
+    end)
+end
+
+local function queueOut(prefix, text)
+    state.outQueue[#state.outQueue + 1] = { prefix = prefix, text = text }
+    processOut()
+end
+
+-- =========================================================================
+-- Antrian pesan masuk
+-- =========================================================================
+local function processIn()
+    if state.busyIn or #state.inQueue == 0 then return end
+    state.busyIn = true
+    local item = table.remove(state.inQueue, 1)
+    translate(promptIn(), toUtf8(item.text), function(ok, result)
+        if ok and not result:find(SAME, 1, true) then
+            sampAddChatMessage(('{66CCFF}[STR] {FFFF99}%s{FFFFFF}: %s'):format(item.name, toGame(result)), -1)
+        end
+        state.busyIn = false
+        processIn()
+    end)
+end
+
+local function queueIn(name, text)
+    text = trim(text)
+    if countLetters(text) < cfg.min_letters then return end
+    local key = name .. '|' .. text
+    local now = os.clock()
+    if state.recent[key] and now - state.recent[key] < 3 then return end
+    state.recent[key] = now
+    if #state.inQueue >= 10 then table.remove(state.inQueue, 1) end -- buang yang terlalu lama
+    state.inQueue[#state.inQueue + 1] = { name = name, text = text }
+    processIn()
+end
+
+-- =========================================================================
+-- Hook SA-MP
+-- =========================================================================
+function sampev.onSendChat(msg)
+    if bypass or not cfg.enabled or not cfg.translate_out then return end
+    local p = cfg.raw_prefix
+    if p ~= '' and msg:sub(1, #p) == p then
+        local rest = trim(msg:sub(#p + 1))
+        if rest == '' then return false end
+        return { rest } -- kirim apa adanya tanpa diterjemahkan
+    end
+    if countLetters(msg) < 1 then return end
+    queueOut('', msg)
+    return false
+end
+
+local function cmdAllowed(cmd)
+    for c in cfg.cmd_list:gmatch('[^,%s]+') do
+        if c:lower() == cmd:lower() then return true end
+    end
+    return false
+end
+
+function sampev.onSendCommand(command)
+    if bypass or not cfg.enabled or not cfg.translate_out or not cfg.translate_cmds then return end
+    local cmd, rest = command:match('^/(%S+)%s+(.+)$')
+    if not cmd or not cmdAllowed(cmd) then return end
+    if countLetters(rest) < 1 then return end
+    queueOut('/' .. cmd .. ' ', rest)
+    return false
+end
+
+function sampev.onChatMessage(playerId, text)
+    if not cfg.enabled or not cfg.translate_in then return end
+    local ok, name = pcall(sampGetPlayerNickname, playerId)
+    queueIn(ok and name or ('ID ' .. playerId), text)
+end
+
+local CHAT_PATTERNS = {
+    '^(.-) says %b(): (.+)$',
+    '^(.-) says: (.+)$',
+    '^(.-) shouts: (.+)$',
+    '^(.-) whispers: (.+)$',
+    '^(.-) %(phone%): (.+)$',
+    '^%(%(%s*(.-): (.-)%s*%)%)$',
+    '^(.-)%s*%[%d+%]: (.+)$',
+    '^(.-)%s*%(%d+%): (.+)$',
+    '^(.-): (.+)$',
+}
+
+function sampev.onServerMessage(color, text)
+    if not cfg.enabled or not cfg.translate_in or not cfg.translate_server then return end
+    local clean = text:gsub('{%x%x%x%x%x%x}', '')
+    for _, pat in ipairs(CHAT_PATTERNS) do
+        local name, msg = clean:match(pat)
+        if name then
+            name = trim(name:gsub('^%[.-%]%s*', '')) -- buang tag seperti [Admin]
+            if name ~= '' and #name <= 24 and isConnectedPlayer(name) then
+                local me = myName()
+                if not (me and me:lower() == name:gsub(' ', '_'):lower()) then
+                    queueIn(name, msg)
+                end
+            end
+            return
+        end
+    end
+end
+
+-- =========================================================================
+-- Menu ImGui (mimgui)
+-- =========================================================================
+local ui = {
+    show            = new.bool(false),
+    enabled         = new.bool(cfg.enabled),
+    translate_out   = new.bool(cfg.translate_out),
+    translate_in    = new.bool(cfg.translate_in),
+    translate_server= new.bool(cfg.translate_server),
+    translate_cmds  = new.bool(cfg.translate_cmds),
+    out_lang        = new.int(cfg.out_lang - 1),
+    in_lang         = new.int(cfg.in_lang - 1),
+    min_letters     = new.int(cfg.min_letters),
+    cooldown        = new.int(cfg.gemini_cooldown),
+    raw_prefix      = new.char[8](cfg.raw_prefix),
+    cmd_list        = new.char[128](cfg.cmd_list),
+    gemini_key      = new.char[256](cfg.gemini_key),
+    gemini_model    = new.char[96](cfg.gemini_model),
+    grok_key        = new.char[256](cfg.grok_key),
+    grok_model      = new.char[96](cfg.grok_model),
+    show_keys       = new.bool(false),
+    test_text       = new.char[256]('di sana ada polisi'),
+    test_in_text    = new.char[256]("Just relax, there's only one police officer there"),
+    test_log        = {},
+}
+local langItems = new['const char*'][#langLabels](langLabels)
+
+local function syncUiFromCfg()
+    ui.enabled[0] = cfg.enabled
+end
+
+local function testLog(line)
+    table.insert(ui.test_log, 1, os.date('[%H:%M:%S] ') .. line)
+    while #ui.test_log > 30 do table.remove(ui.test_log) end
+end
+
+local function wrapped(text)
+    imgui.PushTextWrapPos(0)
+    imgui.TextUnformatted(text)
+    imgui.PopTextWrapPos()
+end
+
+local function colored(r, g, b, text)
+    imgui.PushStyleColor(imgui.Col.Text, imgui.ImVec4(r, g, b, 1))
+    imgui.TextUnformatted(text)
+    imgui.PopStyleColor()
+end
+
+local function runTest(label, fn)
+    local started = os.clock()
+    testLog(label .. ' ... menunggu')
+    fn(function(ok, result, provider)
+        local ms = math.floor((os.clock() - started) * 1000)
+        if ok then
+            testLog(('%s OK (%s, %d ms): %s'):format(label, provider or '-', ms, result))
+        else
+            testLog(('%s GAGAL (%d ms): %s'):format(label, ms, tostring(result)))
+        end
+    end)
+end
+
+local function checkbox(label, key)
+    if imgui.Checkbox(label, ui[key]) then
+        cfg[key] = ui[key][0]
+        markDirty()
+    end
+end
+
+local function inputText(label, key, flags)
+    if imgui.InputText(label, ui[key], sizeof(ui[key]), flags or 0) then
+        cfg[key] = ffistr(ui[key])
+        markDirty()
+    end
+end
+
+imgui.OnInitialize(function()
+    imgui.GetIO().IniFilename = nil
+end)
+
+imgui.OnFrame(function() return ui.show[0] end, function()
+    imgui.SetNextWindowSize(imgui.ImVec2(560, 500), imgui.Cond.FirstUseEver)
+    imgui.Begin('STR Translator  (Gemini -> Grok)', ui.show)
+
+    -- status singkat
+    if cfg.enabled then colored(0.4, 1, 0.4, 'Status: AKTIF') else colored(1, 0.4, 0.4, 'Status: MATI') end
+    imgui.SameLine()
+    imgui.TextUnformatted('  |  Terakhir dipakai: ' .. state.lastProvider)
+    local left = state.geminiBlockedUntil - os.time()
+    if left > 0 then
+        colored(1, 0.8, 0.3, ('Gemini istirahat %d detik lagi (kuota/limit) -> pakai Grok'):format(left))
+    end
+    imgui.Separator()
+
+    if imgui.BeginTabBar('str_tabs') then
+        -- ---------------------------------------------------------------- Umum
+        if imgui.BeginTabItem('Umum') then
+            checkbox('Penerjemah aktif', 'enabled')
+            imgui.Spacing()
+            checkbox('Terjemahkan pesan yang aku ketik', 'translate_out')
+            imgui.SetNextItemWidth(200)
+            if imgui.Combo('Bahasa pesanku', ui.out_lang, langItems, #langLabels) then
+                cfg.out_lang = ui.out_lang[0] + 1
+                markDirty()
+            end
+            imgui.Spacing()
+            checkbox('Terjemahkan pesan lawan bicara', 'translate_in')
+            imgui.SetNextItemWidth(200)
+            if imgui.Combo('Bahasa terjemahan lawan', ui.in_lang, langItems, #langLabels) then
+                cfg.in_lang = ui.in_lang[0] + 1
+                markDirty()
+            end
+            checkbox('Baca chat dari pesan server (format "Nama says: ...")', 'translate_server')
+            imgui.SetNextItemWidth(120)
+            if imgui.InputInt('Minimal huruf pesan lawan', ui.min_letters) then
+                if ui.min_letters[0] < 1 then ui.min_letters[0] = 1 end
+                cfg.min_letters = ui.min_letters[0]
+                markDirty()
+            end
+            imgui.Separator()
+            imgui.SetNextItemWidth(60)
+            inputText('Awalan kirim tanpa terjemah', 'raw_prefix')
+            wrapped('Contoh: ketik ".halo" -> terkirim "halo" tanpa diterjemahkan.')
+            imgui.Spacing()
+            checkbox('Terjemahkan juga perintah ini:', 'translate_cmds')
+            imgui.SetNextItemWidth(250)
+            inputText('##cmdlist', 'cmd_list')
+            wrapped('Pisahkan dengan koma, tanpa garis miring. Contoh: b,s,low,me,do')
+            imgui.EndTabItem()
+        end
+
+        -- ---------------------------------------------------------------- API
+        if imgui.BeginTabItem('API') then
+            local keyFlags = ui.show_keys[0] and 0 or imgui.InputTextFlags.Password
+            colored(0.5, 0.8, 1, 'Gemini (utama)')
+            imgui.SetNextItemWidth(380)
+            inputText('API key Gemini', 'gemini_key', keyFlags)
+            imgui.SetNextItemWidth(250)
+            inputText('Model Gemini', 'gemini_model')
+            imgui.Spacing()
+            colored(0.5, 0.8, 1, 'Grok (cadangan saat Gemini habis/gagal)')
+            imgui.SetNextItemWidth(380)
+            inputText('API key Grok', 'grok_key', keyFlags)
+            imgui.SetNextItemWidth(250)
+            inputText('Model Grok', 'grok_model')
+            imgui.Spacing()
+            imgui.Checkbox('Tampilkan API key', ui.show_keys)
+            imgui.SetNextItemWidth(120)
+            if imgui.InputInt('Istirahat Gemini (detik)', ui.cooldown) then
+                if ui.cooldown[0] < 10 then ui.cooldown[0] = 10 end
+                cfg.gemini_cooldown = ui.cooldown[0]
+                markDirty()
+            end
+            if imgui.Button('Pakai Gemini lagi sekarang') then state.geminiBlockedUntil = 0 end
+            imgui.Separator()
+            wrapped('Key disimpan di moonloader/config/str_translator.json (teks biasa). Jangan bagikan file itu.')
+            imgui.EndTabItem()
+        end
+
+        -- ---------------------------------------------------------------- Test
+        if imgui.BeginTabItem('Test') then
+            colored(0.5, 0.8, 1, 'Cek library')
+            for _, name in ipairs({ 'effil', 'requests', 'ssl', 'mimgui', 'encoding' }) do
+                local ok = state.libs[name]
+                if ok then colored(0.4, 1, 0.4, '  [OK] ' .. name) else colored(1, 0.4, 0.4, '  [TIDAK ADA] ' .. name) end
+            end
+            imgui.Separator()
+
+            imgui.SetNextItemWidth(380)
+            imgui.InputText('Teks pesanku', ui.test_text, sizeof(ui.test_text))
+            if imgui.Button('Test Gemini') then
+                local t = ffistr(ui.test_text)
+                runTest('Gemini', function(done)
+                    callProvider('gemini', promptOut(), t, function(ok, r) done(ok, r, 'gemini') end)
+                end)
+            end
+            imgui.SameLine()
+            if imgui.Button('Test Grok') then
+                local t = ffistr(ui.test_text)
+                runTest('Grok', function(done)
+                    callProvider('grok', promptOut(), t, function(ok, r) done(ok, r, 'grok') end)
+                end)
+            end
+            imgui.SameLine()
+            if imgui.Button('Test otomatis (Gemini -> Grok)') then
+                local t = ffistr(ui.test_text)
+                runTest('Keluar -> ' .. LANGS[cfg.out_lang].label, function(done) translate(promptOut(), t, done) end)
+            end
+
+            imgui.Spacing()
+            imgui.SetNextItemWidth(380)
+            imgui.InputText('Pesan lawan', ui.test_in_text, sizeof(ui.test_in_text))
+            if imgui.Button('Simulasi pesan masuk (muncul di chat)') then
+                local t = ffistr(ui.test_in_text)
+                runTest('Masuk -> ' .. LANGS[cfg.in_lang].label, function(done)
+                    translate(promptIn(), t, function(ok, r, p)
+                        if ok and not r:find(SAME, 1, true) then
+                            sampAddChatMessage('{66CCFF}[STR] {FFFF99}Test{FFFFFF}: ' .. toGame(r), -1)
+                        elseif ok then
+                            r = '(sudah ' .. LANGS[cfg.in_lang].label .. ', tidak diterjemahkan)'
+                        end
+                        done(ok, r, p)
+                    end)
+                end)
+            end
+            imgui.SameLine()
+            if imgui.Button('Bersihkan log') then ui.test_log = {} end
+
+            imgui.Separator()
+            if state.lastError ~= '' then
+                colored(1, 0.5, 0.5, 'Error terakhir:')
+                wrapped(state.lastError)
+                imgui.Separator()
+            end
+            imgui.BeginChild('testlog', imgui.ImVec2(0, 0), true)
+            for _, line in ipairs(ui.test_log) do wrapped(line) end
+            imgui.EndChild()
+            imgui.EndTabItem()
+        end
+        imgui.EndTabBar()
+    end
+    imgui.End()
+end)
+
+-- =========================================================================
+-- Main
+-- =========================================================================
+function main()
+    if not isSampLoaded() or not isSampfuncsLoaded() then return end
+    while not isSampAvailable() do wait(100) end
+
+    loadCfg()
+    ui.enabled[0]          = cfg.enabled
+    ui.translate_out[0]    = cfg.translate_out
+    ui.translate_in[0]     = cfg.translate_in
+    ui.translate_server[0] = cfg.translate_server
+    ui.translate_cmds[0]   = cfg.translate_cmds
+    ui.out_lang[0]         = cfg.out_lang - 1
+    ui.in_lang[0]          = cfg.in_lang - 1
+    ui.min_letters[0]      = cfg.min_letters
+    ui.cooldown[0]         = cfg.gemini_cooldown
+    for _, k in ipairs({ 'raw_prefix', 'cmd_list', 'gemini_key', 'gemini_model', 'grok_key', 'grok_model' }) do
+        ffi.copy(ui[k], cfg[k]:sub(1, sizeof(ui[k]) - 1))
+    end
+
+    for _, name in ipairs({ 'effil', 'requests', 'ssl', 'mimgui', 'encoding' }) do
+        state.libs[name] = (pcall(require, name))
+    end
+
+    sampRegisterChatCommand('str', function(arg)
+        arg = trim((arg or ''):lower())
+        if arg == 'on' then
+            cfg.enabled = true
+            syncUiFromCfg()
+            markDirty()
+            notify('Penerjemah {66FF66}AKTIF{FFFFFF}. Pesanku -> ' .. LANGS[cfg.out_lang].label
+                .. ', pesan lawan -> ' .. LANGS[cfg.in_lang].label)
+        elseif arg == 'off' or arg == 'of' then
+            cfg.enabled = false
+            syncUiFromCfg()
+            markDirty()
+            notify('Penerjemah {FF6666}MATI{FFFFFF}.')
+        else
+            ui.show[0] = not ui.show[0]
+        end
+    end)
+
+    notify('Loaded. Ketik {FFFF99}/str{FFFFFF} untuk menu, {FFFF99}/str on{FFFFFF} / {FFFF99}/str off{FFFFFF}.')
+    if not state.libs.requests or not state.libs.ssl or not state.libs.effil then
+        notify('{FF6666}Library kurang (effil / requests / ssl). Cek tab Test di /str.')
+    end
+    if cfg.gemini_key == '' and cfg.grok_key == '' then
+        notify('Belum ada API key. Isi dulu di {FFFF99}/str{FFFFFF} > tab API.')
+    end
+
+    while true do
+        wait(1000)
+        if dirty then
+            dirty = false
+            saveCfg()
+        end
+        -- bersihkan cache anti-duplikat
+        local now = os.clock()
+        for k, t in pairs(state.recent) do
+            if now - t > 10 then state.recent[k] = nil end
+        end
+    end
+end
