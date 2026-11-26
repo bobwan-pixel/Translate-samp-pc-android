@@ -88,6 +88,8 @@ local function loadCfg()
             if cfg[k] ~= nil and type(v) == type(cfg[k]) then cfg[k] = v end
         end
     end
+    cfg.gemini_key = cfg.gemini_key:gsub('%s', '')
+    cfg.grok_key = cfg.grok_key:gsub('%s', '')
     if not LANGS[cfg.out_lang] then cfg.out_lang = 2 end
     if not LANGS[cfg.in_lang] then cfg.in_lang = 1 end
 end
@@ -535,8 +537,25 @@ end
 
 local function inputText(label, key, flags)
     if imgui.InputText(label, ui[key], sizeof(ui[key]), flags or 0) then
-        cfg[key] = ffistr(ui[key])
+        local v = ffistr(ui[key])
+        if key:find('_key$') then v = v:gsub('%s', '') end -- buang spasi/enter yang ikut tercopy
+        cfg[key] = v
         markDirty()
+    end
+end
+
+-- info singkat agar mudah cek key tanpa menampilkan isinya
+local function keyInfo(key, expectPrefix)
+    local k = cfg[key]
+    if k == '' then
+        colored(1, 0.6, 0.3, '  Key kosong')
+        return
+    end
+    local info = ('  %d karakter, awalan "%s..."'):format(#k, k:sub(1, 4))
+    if expectPrefix and k:sub(1, #expectPrefix) ~= expectPrefix then
+        colored(1, 0.6, 0.3, info .. '  -> biasanya diawali "' .. expectPrefix .. '"')
+    else
+        colored(0.6, 0.9, 0.6, info)
     end
 end
 
@@ -601,12 +620,14 @@ imgui.OnFrame(function() return ui.show[0] end, function()
             colored(0.5, 0.8, 1, 'Gemini (utama)')
             imgui.SetNextItemWidth(380)
             inputText('API key Gemini', 'gemini_key', keyFlags)
+            keyInfo('gemini_key', 'AIza')
             imgui.SetNextItemWidth(250)
             inputText('Model Gemini', 'gemini_model')
             imgui.Spacing()
             colored(0.5, 0.8, 1, 'Grok (cadangan saat Gemini habis/gagal)')
             imgui.SetNextItemWidth(380)
             inputText('API key Grok', 'grok_key', keyFlags)
+            keyInfo('grok_key', 'xai-')
             imgui.SetNextItemWidth(250)
             inputText('Model Grok', 'grok_model')
             imgui.Spacing()
