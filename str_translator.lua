@@ -194,15 +194,17 @@ end
 -- =========================================================================
 -- HTTP async (effil thread + lua-requests)
 -- =========================================================================
-local function httpPost(url, body, headerName, headerValue, cb)
-    local runner = effil.thread(function(url, body, headerName, headerValue)
+local function httpRequest(method, url, body, headerName, headerValue, cb)
+    local runner = effil.thread(function(method, url, body, headerName, headerValue)
         local requests = require 'requests'
         local headers = { ['Content-Type'] = 'application/json' }
         headers[headerName] = headerValue
-        local ok, res = pcall(requests.post, url, { headers = headers, data = body, timeout = 25 })
+        local args = { headers = headers, timeout = 25 }
+        if body ~= '' then args.data = body end
+        local ok, res = pcall(requests.request, method, url, args)
         if not ok then return false, 0, tostring(res) end
         return true, tonumber(res.status_code) or 0, tostring(res.text or '')
-    end)(url, body, headerName, headerValue)
+    end)(method, url, body or '', headerName, headerValue)
 
     lua_thread.create(function()
         while true do
@@ -217,6 +219,14 @@ local function httpPost(url, body, headerName, headerValue, cb)
             wait(0)
         end
     end)
+end
+
+local function httpPost(url, body, headerName, headerValue, cb)
+    httpRequest('POST', url, body, headerName, headerValue, cb)
+end
+
+local function httpGet(url, headerName, headerValue, cb)
+    httpRequest('GET', url, '', headerName, headerValue, cb)
 end
 
 local function apiErrorText(code, text)
@@ -282,7 +292,39 @@ local function callGemini(system, text, cb)
     end)
 end
 
-local function callGroq(system, text, cb)
+-- dipanggil saat model Groq diganti otomatis (diisi di bagian menu)
+local onGroqModelChanged = function() end
+
+-- urutan model yang disukai; kalau tidak ada, ambil model chat aktif apa saja
+local GROQ_PREFER = { 'openai/gpt-oss-120b', 'openai/gpt-oss-20b', 'qwen', 'llama', 'kimi', 'gemma', 'mistral' }
+local GROQ_SKIP = { 'whisper', 'guard', 'tts', 'playai', 'orpheus', 'compound', 'safeguard', 'distil', 'vision', 'allam' }
+
+local function findGroqModel(cb)
+    httpGet('https://api.groq.com/openai/v1/models', 'Authorization', 'Bearer ' .. cfg.groq_key, function(ok, code, resp)
+        if not ok then return cb(false, resp) end
+        if code ~= 200 then return cb(false, apiErrorText(code, resp)) end
+        local okj, j = pcall(decodeJson, resp)
+        if not okj or type(j) ~= 'table' or type(j.data) ~= 'table' then return cb(false, 'daftar model tidak valid') end
+        local list = {}
+        for _, m in ipairs(j.data) do
+            local id = tostring(m.id or '')
+            local skip = (m.active == false) or id == ''
+            for _, s in ipairs(GROQ_SKIP) do if id:lower():find(s, 1, true) then skip = true end end
+            if not skip then list[#list + 1] = id end
+        end
+        table.sort(list)
+        state.groqModels = list
+        for _, want in ipairs(GROQ_PREFER) do
+            for _, id in ipairs(list) do
+                if id == want or id:lower():find(want, 1, true) then return cb(true, id) end
+            end
+        end
+        if list[1] then return cb(true, list[1]) end
+        cb(false, 'tidak ada model chat aktif di akun Groq ini')
+    end)
+end
+
+local function callGroq(system, text, cb, retried)
     local req = {
         model = cfg.groq_model,
         messages = {
@@ -295,6 +337,18 @@ local function callGroq(system, text, cb)
     local body = encodeJson(req)
     httpPost('https://api.groq.com/openai/v1/chat/completions', body, 'Authorization', 'Bearer ' .. cfg.groq_key, function(ok, code, resp)
         if not ok then return cb(false, resp, code) end
+        -- model tidak ada / sudah dimatikan -> cari model aktif lalu coba sekali lagi
+        if (code == 404 or (code == 400 and resp:find('decommission'))) and not retried then
+            return findGroqModel(function(okm, model)
+                if okm and model ~= cfg.groq_model then
+                    cfg.groq_model = model
+                    onGroqModelChanged()
+                    markDirty()
+                    return callGroq(system, text, cb, true)
+                end
+                cb(false, apiErrorText(code, resp) .. (okm and '' or (' | cari model: ' .. tostring(model))), code)
+            end)
+        end
         if code ~= 200 then return cb(false, apiErrorText(code, resp), code) end
         local okj, j = pcall(decodeJson, resp)
         if not okj or type(j) ~= 'table' then return cb(false, 'respon Groq tidak valid', code) end
@@ -532,6 +586,10 @@ local ui = {
 }
 local langItems = new['const char*'][#langLabels](langLabels)
 
+onGroqModelChanged = function()
+    ffi.copy(ui.groq_model, cfg.groq_model:sub(1, sizeof(ui.groq_model) - 1))
+end
+
 local function syncUiFromCfg()
     ui.enabled[0] = cfg.enabled
 end
@@ -672,6 +730,30 @@ imgui.OnFrame(function() return ui.show[0] end, function()
             keyInfo('groq_key', 'gsk_')
             imgui.SetNextItemWidth(250)
             inputText('Model Groq', 'groq_model')
+            if imgui.Button('Cari model Groq otomatis') then
+                if cfg.groq_key == '' then
+                    state.groqFind = 'Isi API key Groq dulu.'
+                else
+                    state.groqFind = 'Mencari...'
+                    findGroqModel(function(ok, model)
+                        if ok then
+                            cfg.groq_model = model
+                            onGroqModelChanged()
+                            markDirty()
+                            state.groqFind = 'Dipakai: ' .. model
+                        else
+                            state.groqFind = 'Gagal: ' .. tostring(model)
+                        end
+                    end)
+                end
+            end
+            if state.groqFind then
+                imgui.SameLine()
+                imgui.TextUnformatted(state.groqFind)
+            end
+            if state.groqModels and #state.groqModels > 0 then
+                wrapped('Model aktif di akunmu: ' .. table.concat(state.groqModels, ', '))
+            end
             imgui.Spacing()
             imgui.Checkbox('Tampilkan API key', ui.show_keys)
             imgui.SetNextItemWidth(120)
@@ -706,7 +788,7 @@ imgui.OnFrame(function() return ui.show[0] end, function()
             imgui.SameLine()
             if imgui.Button('Test Groq') then
                 local t = ffistr(ui.test_text)
-                runTest('Groq', function(done)
+                runTest('Groq (' .. cfg.groq_model .. ')', function(done)
                     callProvider('groq', promptOut(), t, function(ok, r) done(ok, r, 'groq') end)
                 end)
             end
