@@ -21,7 +21,7 @@
 
 script_name('STR Translator')
 script_author('bobwan-pixel')
-script_version('1.4.1')
+script_version('1.4.2')
 
 require 'lib.moonloader'
 local sampev   = require 'lib.samp.events'
@@ -1375,7 +1375,7 @@ function main()
         state.libs[name] = (pcall(require, name))
     end
 
-    sampRegisterChatCommand('str', function(arg)
+    local function strCommand(arg)
         arg = trim((arg or ''):lower()):gsub('%s+', ' ')
         if arg == '' or arg == 'menu' then
             ui.show[0] = not ui.show[0]
@@ -1428,9 +1428,28 @@ function main()
             notify('{FF6666}Perintah tidak dikenal: /str ' .. arg)
             notify('Pakai: /str (menu), /str on, /str off, /str fokus, /str add ID, /str del ID, /str list, /str clear')
         end
-    end)
+    end
 
-    notify('Loaded v1.4.1. Ketik {FFFF99}/str{FFFFFF} untuk menu, {FFFF99}/str on{FFFFFF} / {FFFF99}/str off{FFFFFF}. CopyRight By:Bobwan.')
+    -- rebut /str walaupun sudah dipakai salinan script lama (yang lama tidak kenal add/fokus)
+    pcall(sampUnregisterChatCommand, 'str')
+    local okReg, reg = pcall(sampRegisterChatCommand, 'str', strCommand)
+    if not okReg or reg == false then
+        notify('{FF6666}Perintah /str dipakai script lain. Pakai /strmenu, /stradd, /strdel, /strfokus, /strlist.')
+    end
+    -- perintah cadangan yang tidak bisa bentrok
+    local backup = {
+        strmenu  = function() strCommand('') end,
+        stradd   = function(a) strCommand('add ' .. (a or '')) end,
+        strdel   = function(a) strCommand('del ' .. (a or '')) end,
+        strfokus = function(a) strCommand('fokus ' .. (a or '')) end,
+        strlist  = function() strCommand('list') end,
+    }
+    for name, fn in pairs(backup) do
+        pcall(sampUnregisterChatCommand, name)
+        pcall(sampRegisterChatCommand, name, fn)
+    end
+
+    notify('Loaded v1.4.2. Ketik {FFFF99}/str{FFFFFF} untuk menu, {FFFF99}/str on{FFFFFF} / {FFFF99}/str off{FFFFFF}. CopyRight By:Bobwan.')
     -- peringatan kalau ada salinan script lain yang juga memakai /str (bikin bentrok)
     pcall(function()
         local me = thisScript()
