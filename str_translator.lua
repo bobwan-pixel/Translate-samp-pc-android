@@ -19,7 +19,7 @@
 
 script_name('STR Translator')
 script_author('bobwan-pixel')
-script_version('1.0')
+script_version('1.3')
 
 require 'lib.moonloader'
 local sampev   = require 'lib.samp.events'
@@ -79,8 +79,10 @@ local cfg = {
     gemini_key       = '',
     gemini_model     = 'gemini-3.5-flash-lite',
     groq_key         = '',
-    groq_model       = 'openai/gpt-oss-120b',
-    gemini_cooldown  = 300,     -- detik Gemini diistirahatkan setelah limit/kuota habis
+    groq_model       = 'openai/gpt-oss-20b',
+    max_rpm          = 20,      -- batas request per menit untuk pesan lawan (hindari 429)
+    skip_indo        = true,    -- pesan lawan yang jelas bahasa Indonesia tidak dikirim ke AI
+    cfg_version      = 3,
     debug            = false,   -- tampilkan jawaban mentah AI di chat
 }
 
@@ -91,17 +93,23 @@ local function loadCfg()
     local raw = f:read('*a')
     f:close()
     local ok, t = pcall(decodeJson, raw)
+    local oldVersion = 0
     if ok and type(t) == 'table' then
+        oldVersion = tonumber(t.cfg_version) or 0
         for k, v in pairs(t) do
             if cfg[k] ~= nil and type(v) == type(cfg[k]) then cfg[k] = v end
         end
     end
+    -- versi 3: gpt-oss-120b diganti gpt-oss-20b (jauh lebih cepat)
+    if oldVersion < 3 and cfg.groq_model == 'openai/gpt-oss-120b' then cfg.groq_model = 'openai/gpt-oss-20b' end
+    cfg.cfg_version = 3
+    if cfg.max_rpm < 1 then cfg.max_rpm = 20 end
     cfg.gemini_key = cfg.gemini_key:gsub('%s', '')
     cfg.groq_key = cfg.groq_key:gsub('%s', '')
     -- model Groq lama yang sudah dimatikan -> ganti otomatis
     local deadGroq = { ['llama-3.3-70b-versatile'] = false, ['llama-3.1-8b-instant'] = true,
                        ['qwen/qwen3-32b'] = true, ['meta-llama/llama-4-scout-17b-16e-instruct'] = true }
-    if deadGroq[cfg.groq_model] then cfg.groq_model = 'openai/gpt-oss-120b' end
+    if deadGroq[cfg.groq_model] then cfg.groq_model = 'openai/gpt-oss-20b' end
     if not LANGS[cfg.out_lang] then cfg.out_lang = 2 end
     if not LANGS[cfg.in_lang] then cfg.in_lang = 1 end
 end
@@ -204,7 +212,7 @@ local function httpRequest(method, url, body, headerName, headerValue, cb)
         local requests = require 'requests'
         local headers = { ['Content-Type'] = 'application/json' }
         headers[headerName] = headerValue
-        local args = { headers = headers, timeout = 10 }
+        local args = { headers = headers, timeout = 7 }
         if body ~= '' then args.data = body end
         local ok, res = pcall(requests.request, method, url, args)
         if not ok then return false, 0, tostring(res) end
@@ -250,16 +258,54 @@ end
 -- Provider AI
 -- =========================================================================
 local state = {
-    geminiBlockedUntil = 0,
+    blockedUntil = { gemini = 0, groq = 0 },  -- provider diistirahatkan sampai waktu ini (os.time)
+    blockReason  = { gemini = '', groq = '' },
     lastProvider = '-',
     lastError = '',
+    lastMs = 0,
     outQueue = {},
     inQueue = {},
     busyOut = false,
-    busyIn = false,
+    inFlight = 0,
     recent = {},
     libs = {},
+    reqTimes = {},
+    stats = { skipped = 0, dropped = 0, cached = 0, batches = 0 },
 }
+
+-- notifikasi yang sama paling sering sekali per 30 detik (tidak spam chat)
+local notifyTimes = {}
+local function notifyThrottled(key, text)
+    local now = os.time()
+    if notifyTimes[key] and now - notifyTimes[key] < 30 then return end
+    notifyTimes[key] = now
+    pcall(notify, text)
+end
+
+-- hitung request per menit (untuk membatasi pesan masuk supaya tidak kena 429)
+local function requestsLastMinute()
+    local now, n, keep = os.clock(), 0, {}
+    for _, t in ipairs(state.reqTimes) do
+        if now - t < 60 then n = n + 1; keep[#keep + 1] = t end
+    end
+    state.reqTimes = keep
+    return n
+end
+local function spendRequest() state.reqTimes[#state.reqTimes + 1] = os.clock() end
+
+-- baca "tunggu berapa detik" dari pesan error 429 (Gemini: retryDelay, Groq: "try again in 7.5s")
+local function retryAfter(resp)
+    resp = tostring(resp or '')
+    local s = resp:match('"retryDelay"%s*:%s*"([%d%.]+)s"')
+    if s then return tonumber(s) end
+    local m, sec = resp:match('try again in (%d+)m([%d%.]+)s')
+    if m then return tonumber(m) * 60 + tonumber(sec) end
+    s = resp:match('try again in ([%d%.]+)s')
+    if s then return tonumber(s) end
+    s = resp:match('try again in ([%d%.]+)ms')
+    if s then return tonumber(s) / 1000 end
+    return nil
+end
 
 local function callGemini(system, text, cb)
     local url = 'https://generativelanguage.googleapis.com/v1beta/models/' .. cfg.gemini_model .. ':generateContent'
@@ -268,8 +314,8 @@ local function callGemini(system, text, cb)
         contents = { { role = 'user', parts = { { text = text } } } },
     })
     local function handle(ok, code, resp)
-        if not ok then return cb(false, resp, code) end
-        if code ~= 200 then return cb(false, apiErrorText(code, resp), code) end
+        if not ok then return cb(false, resp, code, resp) end
+        if code ~= 200 then return cb(false, apiErrorText(code, resp), code, resp) end
         local okj, j = pcall(decodeJson, resp)
         if not okj or type(j) ~= 'table' then return cb(false, 'respon Gemini tidak valid', code) end
         local cand = j.candidates and j.candidates[1]
@@ -282,15 +328,18 @@ local function callGemini(system, text, cb)
         for _, p in ipairs(parts) do
             if p.text and not p.thought then out[#out + 1] = p.text end
         end
-        local result = trim(table.concat(out, ' '))
+        local result = trim(table.concat(out, '\n'))
         if result == '' then return cb(false, 'jawaban Gemini kosong', code) end
         cb(true, result, code)
     end
     -- cara 1: key lewat header x-goog-api-key (cara resmi, juga untuk key format baru "AQ.")
+    spendRequest()
     httpPost(url, body, 'x-goog-api-key', cfg.gemini_key, function(ok, code, resp)
-        if ok and code == 401 then
-            -- cara 2: coba sekali lagi dengan key di URL (?key=)
+        if ok and code == 401 and not state.geminiQueryTried then
+            -- cara 2 (sekali saja per sesi): key di URL (?key=)
+            state.geminiQueryTried = true
             local key = cfg.gemini_key:gsub('[^%w%-%._~]', function(c) return ('%%%02X'):format(c:byte()) end)
+            spendRequest()
             return httpPost(url .. '?key=' .. key, body, 'Accept', 'application/json', handle)
         end
         handle(ok, code, resp)
@@ -300,8 +349,8 @@ end
 -- dipanggil saat model Groq diganti otomatis (diisi di bagian menu)
 local onGroqModelChanged = function() end
 
--- urutan model yang disukai; kalau tidak ada, ambil model chat aktif apa saja
-local GROQ_PREFER = { 'openai/gpt-oss-120b', 'openai/gpt-oss-20b', 'qwen', 'llama', 'kimi', 'gemma', 'mistral' }
+-- urutan model yang disukai; yang cepat dulu. Kalau tidak ada, ambil model chat aktif apa saja
+local GROQ_PREFER = { 'openai/gpt-oss-20b', 'openai/gpt-oss-120b', 'qwen', 'llama', 'kimi', 'gemma', 'mistral' }
 local GROQ_SKIP = { 'whisper', 'guard', 'tts', 'playai', 'orpheus', 'compound', 'safeguard', 'distil', 'vision', 'allam' }
 
 local function findGroqModel(cb)
@@ -336,12 +385,17 @@ local function callGroq(system, text, cb, retried)
             { role = 'system', content = system },
             { role = 'user', content = text },
         },
+        max_completion_tokens = 400,
     }
     -- model gpt-oss "berpikir" dulu; dibuat singkat supaya terjemahan cepat
-    if cfg.groq_model:find('gpt%-oss') then req.reasoning_effort = 'low' end
+    if cfg.groq_model:find('gpt%-oss') then
+        req.reasoning_effort = 'low'
+        req.max_completion_tokens = 900 -- token berpikir ikut dihitung
+    end
     local body = encodeJson(req)
+    spendRequest()
     httpPost('https://api.groq.com/openai/v1/chat/completions', body, 'Authorization', 'Bearer ' .. cfg.groq_key, function(ok, code, resp)
-        if not ok then return cb(false, resp, code) end
+        if not ok then return cb(false, resp, code, resp) end
         -- model tidak ada / sudah dimatikan -> cari model aktif lalu coba sekali lagi
         if (code == 404 or (code == 400 and resp:find('decommission'))) and not retried then
             return findGroqModel(function(okm, model)
@@ -351,10 +405,10 @@ local function callGroq(system, text, cb, retried)
                     markDirty()
                     return callGroq(system, text, cb, true)
                 end
-                cb(false, apiErrorText(code, resp) .. (okm and '' or (' | cari model: ' .. tostring(model))), code)
+                cb(false, apiErrorText(code, resp) .. (okm and '' or (' | cari model: ' .. tostring(model))), code, resp)
             end)
         end
-        if code ~= 200 then return cb(false, apiErrorText(code, resp), code) end
+        if code ~= 200 then return cb(false, apiErrorText(code, resp), code, resp) end
         local okj, j = pcall(decodeJson, resp)
         if not okj or type(j) ~= 'table' then return cb(false, 'respon Groq tidak valid', code) end
         local msg = j.choices and j.choices[1] and j.choices[1].message
@@ -374,15 +428,39 @@ local function callProvider(name, system, text, cb)
     end
 end
 
--- Gemini dulu; kalau gagal/habis -> langsung Groq
-local function translate(system, text, cb)
-    local order = {}
-    local geminiReady = os.time() >= state.geminiBlockedUntil
-    if cfg.gemini_key ~= '' and geminiReady then order[#order + 1] = 'gemini' end
-    if cfg.groq_key ~= '' then order[#order + 1] = 'groq' end
-    if #order == 0 and cfg.gemini_key ~= '' then order[1] = 'gemini' end -- tidak ada cadangan, coba saja
-    if #order == 0 then return cb(false, 'belum ada API key (isi di /str > API)') end
+local PROVIDER_LABEL = { gemini = 'Gemini', groq = 'Groq' }
 
+-- istirahatkan provider yang gagal supaya pesan berikutnya tidak buang waktu
+local function blockProvider(p, code, raw)
+    local secs, why
+    if code == 429 then
+        secs = retryAfter(raw) or 60
+        secs = math.max(5, math.min(secs + 1, 3600))
+        why = 'kena limit (429)'
+    elseif code == 401 or code == 403 then
+        secs = 600
+        why = 'key ditolak (' .. code .. ')'
+    else
+        return
+    end
+    state.blockedUntil[p] = os.time() + math.floor(secs)
+    state.blockReason[p] = why
+    notifyThrottled('block_' .. p, ('{FFAA00}%s %s, dilewati %d detik.'):format(PROVIDER_LABEL[p], why, math.floor(secs)))
+end
+
+-- Gemini dulu; kalau gagal/limit -> langsung Groq pada pesan yang sama
+local function translate(system, text, cb)
+    local now = os.time()
+    local order = {}
+    for _, p in ipairs({ 'gemini', 'groq' }) do
+        if cfg[p .. '_key'] ~= '' and now >= state.blockedUntil[p] then order[#order + 1] = p end
+    end
+    if #order == 0 then
+        if cfg.gemini_key == '' and cfg.groq_key == '' then return cb(false, 'belum ada API key (isi di /str > API)') end
+        return cb(false, 'semua provider sedang istirahat (limit / key ditolak)')
+    end
+
+    local started = os.clock()
     local i, errors = 0, {}
     local function try()
         i = i + 1
@@ -391,14 +469,13 @@ local function translate(system, text, cb)
             state.lastError = table.concat(errors, ' | ')
             return cb(false, state.lastError)
         end
-        callProvider(p, system, text, function(ok, result, code)
+        callProvider(p, system, text, function(ok, result, code, raw)
             if ok then
                 state.lastProvider = p
+                state.lastMs = math.floor((os.clock() - started) * 1000)
                 return cb(true, result, p)
             end
-            if p == 'gemini' and (code == 429 or code == 403) then
-                state.geminiBlockedUntil = os.time() + cfg.gemini_cooldown
-            end
+            blockProvider(p, code, raw)
             errors[#errors + 1] = p .. ': ' .. tostring(result)
             try()
         end)
@@ -413,24 +490,32 @@ local SAME = '__SAME__'
 
 local function promptOut()
     local L = LANGS[cfg.out_lang]
-    local p = 'You translate chat messages for an online GTA San Andreas Multiplayer (SA-MP) roleplay server. '
-        .. 'Translate the user message into ' .. L.name .. '. Keep the meaning and player names. '
+    local p = 'Translate this SA-MP roleplay game chat message into ' .. L.name .. '. Keep the meaning and player names. '
     if L.style then
-        p = p .. L.style .. ' If the message is already in ' .. L.name .. ', rewrite it in that style. '
+        p = p .. L.style .. ' If it is already in ' .. L.name .. ', rewrite it in that style. '
     else
-        p = p .. 'Keep the casual tone and slang. If the message is already in ' .. L.name .. ', return it unchanged. '
+        p = p .. 'Keep the casual tone and slang. If it is already in ' .. L.name .. ', return it unchanged. '
     end
-    return p .. 'Reply with ONLY the translated text on a single line: no quotes, no emojis, no notes, no explanations.'
+    return p .. 'Reply with ONLY the result on one line: no quotes, no emojis, no notes.'
 end
 
 local function promptIn()
     local L = LANGS[cfg.in_lang]
-    local p = 'You translate chat messages from other players on an online GTA San Andreas Multiplayer (SA-MP) roleplay server. '
-        .. 'Other players may use street slang from any country (American, Mexican, etc.); understand the slang and translate its real meaning. '
-        .. 'If the message is already written in ' .. L.name .. ', or it has no real words to translate, reply with exactly ' .. SAME .. '. '
-        .. 'Otherwise translate it into ' .. L.name .. ' with a casual, natural tone, keeping player names. '
+    local p = 'Translate this SA-MP roleplay game chat message from another player into casual ' .. L.name .. '. '
+        .. 'Understand street slang (American, Mexican, etc.) and translate its real meaning. Keep player names. '
+        .. 'If it is already in ' .. L.name .. ' or has nothing to translate, reply exactly ' .. SAME .. '. '
     if L.style then p = p .. L.style .. ' ' end
-    return p .. 'Reply with ONLY the translation on a single line: no quotes, no emojis, no notes, no explanations.'
+    return p .. 'Reply with ONLY the result on one line: no quotes, no emojis, no notes.'
+end
+
+local function promptInBatch(n)
+    local L = LANGS[cfg.in_lang]
+    local p = 'You get ' .. n .. ' numbered SA-MP roleplay game chat lines from other players. '
+        .. 'Translate each into casual ' .. L.name .. ', understanding street slang (American, Mexican, etc.). Keep player names. '
+        .. 'Answer with exactly ' .. n .. ' lines in the same order, each as "<number>) <translation>". '
+        .. 'If a line is already in ' .. L.name .. ' or has nothing to translate, write "<number>) ' .. SAME .. '". '
+    if L.style then p = p .. L.style .. ' ' end
+    return p .. 'No quotes, no emojis, no other text.'
 end
 
 -- =========================================================================
@@ -444,38 +529,61 @@ local function sendRaw(text)
     bypass = false
 end
 
--- =========================================================================
--- Antrian pesan keluar (berurutan supaya urutan chat tidak acak)
--- =========================================================================
-local QUEUE_TIMEOUT = 22 -- detik; lewat dari ini pesan asli dikirim supaya antrian tidak macet
-
 local function safeGame(s)
     local ok, r = pcall(toGame, tostring(s))
     return ok and r or '?'
 end
+
+-- cache kecil: teks yang sama tidak diterjemahkan ulang (hemat kuota, instan)
+local function newCache(max)
+    local c = { data = {}, size = 0, max = max }
+    function c:get(k) return self.data[k] end
+    function c:set(k, v)
+        if self.data[k] == nil then
+            self.size = self.size + 1
+            if self.size > self.max then self.data, self.size = {}, 1 end
+        end
+        self.data[k] = v
+    end
+    return c
+end
+local outCache = newCache(150)
+local inCache = newCache(300)
+
+-- =========================================================================
+-- Antrian pesan keluar (berurutan supaya urutan chat tidak acak)
+-- =========================================================================
+local QUEUE_TIMEOUT = 16 -- detik; lewat dari ini pesan asli dikirim (cukup untuk Gemini + cadangan Groq)
 
 local function processOut()
     if state.busyOut or #state.outQueue == 0 then return end
     state.busyOut = true
     local item = table.remove(state.outQueue, 1)
     local original = item.prefix .. item.text
+    local cacheKey = cfg.out_lang .. '|' .. item.text
     local done = false
 
     -- apa pun yang terjadi, fungsi ini SELALU membuka antrian lagi
     local function finish(text, warn)
         if done then return end
         done = true
-        if warn then pcall(notify, warn) end
+        if warn then notifyThrottled('out_warn', warn) end
         local okSend, errSend = pcall(sendRaw, text)
         if not okSend then pcall(notify, '{FF6666}Gagal kirim chat: ' .. tostring(errSend)) end
         state.busyOut = false
         processOut()
     end
 
+    local cached = outCache:get(cacheKey)
+    if cached then
+        state.stats.cached = state.stats.cached + 1
+        return finish(item.prefix .. cached)
+    end
+
     -- pengaman: AI terlalu lama / tidak menjawab -> kirim pesan asli
     lua_thread.create(function()
         wait(QUEUE_TIMEOUT * 1000)
-        finish(original, '{FF6666}AI terlalu lama menjawab, pesan asli dikirim.')
+        finish(original, '{FFAA00}AI terlalu lama menjawab, pesan asli dikirim.')
     end)
 
     local okCall, errCall = pcall(translate, promptOut(), toUtf8(item.text), function(ok, result)
@@ -491,6 +599,7 @@ local function processOut()
         if countLetters(out) == 0 then
             return finish(original, '{FF6666}Jawaban AI kosong setelah dibersihkan, pesan asli dikirim.')
         end
+        outCache:set(cacheKey, out)
         finish(item.prefix .. out)
     end)
     if not okCall then
@@ -499,35 +608,116 @@ local function processOut()
 end
 
 local function queueOut(prefix, text)
+    if #state.outQueue >= 5 then
+        notifyThrottled('out_full', '{FFAA00}Antrian penuh, pesan dikirim tanpa terjemahan.')
+        return sendRaw(prefix .. text)
+    end
     state.outQueue[#state.outQueue + 1] = { prefix = prefix, text = text }
     processOut()
 end
 
 -- =========================================================================
--- Antrian pesan masuk
+-- Deteksi cepat bahasa Indonesia (tanpa AI) -> tidak buang kuota & waktu
 -- =========================================================================
-local function processIn()
-    if state.busyIn or #state.inQueue == 0 then return end
-    state.busyIn = true
-    local item = table.remove(state.inQueue, 1)
+local INDO_WORDS = {}
+for w in ([[yang aku gue gua gw kamu lu lo elu dia kita kami mereka gak ga gk nggak ngga enggak engga tidak
+    udah udh sudah belum blm lagi lg sini sana situ apa ini itu dan atau di ke dari buat untuk utk sama sm dong
+    deh kok sih aja aj juga jg bisa bs ada tau tahu kenapa knp napa gimana gmn bagaimana dimana mana kapan siapa
+    jangan jgn tolong terus trus banget bgt bang bg kak bos gan cuy cok anjir njir anjay wkwk wkwkwk awokawok
+    hehe haha mantap mantul sabar bentar bntr nanti ntar mau pengen ingin kalo kalau klo karena krn soalnya
+    punya mobil motor rumah polisi duit uang beli jual kerja kemana darimana ayo yuk oke makasih terima kasih]]):gmatch('%S+') do
+    INDO_WORDS[w] = true
+end
+
+local function looksIndonesian(text)
+    local words, hits = 0, 0
+    for w in text:lower():gmatch('%a+') do
+        words = words + 1
+        if INDO_WORDS[w] or w:find('^wk+w') or w:find('^ha?ha') then hits = hits + 1 end
+    end
+    if words == 0 then return true end
+    if words <= 3 then return hits >= 1 and hits * 2 >= words end
+    return hits >= 2 and hits / words >= 0.25
+end
+
+-- =========================================================================
+-- Antrian pesan masuk: digabung (batch) + paralel supaya tidak menumpuk
+-- =========================================================================
+local IN_PARALLEL = 2   -- maksimal request pesan masuk yang berjalan bersamaan
+local IN_BATCH    = 6   -- maksimal pesan digabung dalam satu request
+local IN_MAX_AGE  = 25  -- detik; pesan yang menunggu lebih lama dari ini dibuang
+
+local function showIn(name, gameText)
+    pcall(function()
+        sampAddChatMessage(('{66CCFF}[STR] {FFFF99}%s{FFFFFF}: %s'):format(name, gameText), -1)
+    end)
+end
+
+local function handleInResult(item, result)
+    local ck = cfg.in_lang .. '|' .. item.text
+    result = trim(tostring(result or ''))
+    if result == '' then return end
+    if result:find(SAME, 1, true) then
+        inCache:set(ck, SAME)
+        return
+    end
+    local okConv, g = pcall(toGame, result)
+    if not okConv or countLetters(g) == 0 then return end
+    -- jawaban sama persis dengan aslinya = tidak perlu ditampilkan
+    if g:lower() == item.text:lower() then
+        inCache:set(ck, SAME)
+        return
+    end
+    inCache:set(ck, g)
+    showIn(item.name, g)
+end
+
+local processIn
+
+local function runInBatch(batch)
+    state.inFlight = state.inFlight + 1
+    state.stats.batches = state.stats.batches + 1
     local done = false
     local function finish()
         if done then return end
         done = true
-        state.busyIn = false
+        state.inFlight = state.inFlight - 1
         processIn()
     end
     lua_thread.create(function()
         wait(QUEUE_TIMEOUT * 1000)
         finish()
     end)
-    local okCall = pcall(translate, promptIn(), toUtf8(item.text), function(ok, result)
+
+    local system, text
+    if #batch == 1 then
+        system, text = promptIn(), toUtf8(batch[1].text)
+    else
+        local lines = {}
+        for i, it in ipairs(batch) do
+            lines[i] = i .. ') ' .. (toUtf8(it.text):gsub('[\r\n]+', ' '))
+        end
+        system, text = promptInBatch(#batch), table.concat(lines, '\n')
+    end
+
+    local okCall = pcall(translate, system, text, function(ok, result)
         if done then return end
-        if ok and not result:find(SAME, 1, true) then
-            pcall(function()
-                sampAddChatMessage(('{66CCFF}[STR] {FFFF99}%s{FFFFFF}: %s'):format(item.name, toGame(result)), -1)
-            end)
-        elseif not ok and cfg.debug then
+        if ok then
+            if cfg.debug then pcall(notify, '{AAAAAA}AI (masuk x' .. #batch .. '): ' .. safeGame(result):sub(1, 110)) end
+            if #batch == 1 then
+                handleInResult(batch[1], (tostring(result):gsub('^%s*1%s*[%)%.:]%s*', '')))
+            else
+                local got = {}
+                for line in (tostring(result) .. '\n'):gmatch('([^\r\n]*)\r?\n') do
+                    local n, t = line:match('^%s*(%d+)%s*[%)%.:%-]%s*(.*)$')
+                    n = tonumber(n)
+                    if n and batch[n] and not got[n] then
+                        got[n] = true
+                        handleInResult(batch[n], t)
+                    end
+                end
+            end
+        elseif cfg.debug then
             pcall(notify, '{AAAAAA}Gagal terjemah pesan masuk: ' .. safeGame(result):sub(1, 90))
         end
         finish()
@@ -535,15 +725,47 @@ local function processIn()
     if not okCall then finish() end
 end
 
+processIn = function()
+    while state.inFlight < IN_PARALLEL and #state.inQueue > 0 do
+        -- buang pesan yang sudah terlalu lama menunggu (tidak relevan lagi)
+        local now = os.clock()
+        while state.inQueue[1] and now - state.inQueue[1].t > IN_MAX_AGE do
+            table.remove(state.inQueue, 1)
+            state.stats.dropped = state.stats.dropped + 1
+        end
+        if #state.inQueue == 0 then return end
+        -- batas request per menit; sisa antrian dicoba lagi dari loop utama
+        if requestsLastMinute() >= cfg.max_rpm then return end
+        local batch = {}
+        while #batch < IN_BATCH and #state.inQueue > 0 do
+            batch[#batch + 1] = table.remove(state.inQueue, 1)
+        end
+        runInBatch(batch)
+    end
+end
+
 local function queueIn(name, text)
     text = trim(text)
     if countLetters(text) < cfg.min_letters then return end
+    if cfg.skip_indo and LANGS[cfg.in_lang].name == 'Indonesian' and looksIndonesian(text) then
+        state.stats.skipped = state.stats.skipped + 1
+        return
+    end
+    local cached = inCache:get(cfg.in_lang .. '|' .. text)
+    if cached then
+        state.stats.cached = state.stats.cached + 1
+        if cached ~= SAME then showIn(name, cached) end
+        return
+    end
     local key = name .. '|' .. text
     local now = os.clock()
     if state.recent[key] and now - state.recent[key] < 3 then return end
     state.recent[key] = now
-    if #state.inQueue >= 10 then table.remove(state.inQueue, 1) end -- buang yang terlalu lama
-    state.inQueue[#state.inQueue + 1] = { name = name, text = text }
+    if #state.inQueue >= 20 then
+        table.remove(state.inQueue, 1)
+        state.stats.dropped = state.stats.dropped + 1
+    end
+    state.inQueue[#state.inQueue + 1] = { name = name, text = text, t = now }
     processIn()
 end
 
@@ -595,6 +817,7 @@ local CHAT_PATTERNS = {
     '^(.-)%s*%[%d+%]: (.+)$',
     '^(.-)%s*%(%d+%): (.+)$',
     '^(.-): (.+)$',
+    '^%*%s*(.-)%s+(.+)$',     -- /me : "* Nama melakukan sesuatu"
 }
 
 function sampev.onServerMessage(color, text)
@@ -629,7 +852,8 @@ local ui = {
     out_lang        = new.int(cfg.out_lang - 1),
     in_lang         = new.int(cfg.in_lang - 1),
     min_letters     = new.int(cfg.min_letters),
-    cooldown        = new.int(cfg.gemini_cooldown),
+    max_rpm         = new.int(cfg.max_rpm),
+    skip_indo       = new.bool(cfg.skip_indo),
     raw_prefix      = new.char[8](cfg.raw_prefix),
     cmd_list        = new.char[128](cfg.cmd_list),
     gemini_key      = new.char[256](cfg.gemini_key),
@@ -727,10 +951,14 @@ imgui.OnFrame(function() return ui.show[0] end, function()
     -- status singkat
     if cfg.enabled then colored(0.4, 1, 0.4, 'Status: AKTIF') else colored(1, 0.4, 0.4, 'Status: MATI') end
     imgui.SameLine()
-    imgui.TextUnformatted('  |  Terakhir dipakai: ' .. state.lastProvider)
-    local left = state.geminiBlockedUntil - os.time()
-    if left > 0 then
-        colored(1, 0.8, 0.3, ('Gemini istirahat %d detik lagi (kuota/limit) -> pakai Groq'):format(left))
+    imgui.TextUnformatted(('  |  Terakhir: %s (%d ms)  |  Antrian masuk: %d'):format(state.lastProvider, state.lastMs, #state.inQueue))
+    for _, p in ipairs({ 'gemini', 'groq' }) do
+        local left = state.blockedUntil[p] - os.time()
+        if left > 0 then
+            colored(1, 0.8, 0.3, ('%s dilewati %d detik lagi: %s'):format(PROVIDER_LABEL[p], left, state.blockReason[p]))
+            imgui.SameLine()
+            if imgui.SmallButton('Coba lagi##' .. p) then state.blockedUntil[p] = 0 end
+        end
     end
     imgui.Separator()
 
@@ -759,6 +987,15 @@ imgui.OnFrame(function() return ui.show[0] end, function()
                 cfg.min_letters = ui.min_letters[0]
                 markDirty()
             end
+            checkbox('Lewati pesan lawan yang sudah bahasa Indonesia (tanpa AI, lebih cepat)', 'skip_indo')
+            imgui.SetNextItemWidth(120)
+            if imgui.InputInt('Batas request/menit untuk pesan lawan', ui.max_rpm) then
+                if ui.max_rpm[0] < 1 then ui.max_rpm[0] = 1 end
+                cfg.max_rpm = ui.max_rpm[0]
+                markDirty()
+            end
+            wrapped(('Dilewati (sudah Indonesia): %d  |  Dari cache: %d  |  Dibuang (kelamaan): %d  |  Request: %d'):format(
+                state.stats.skipped, state.stats.cached, state.stats.dropped, state.stats.batches))
             imgui.Separator()
             imgui.SetNextItemWidth(60)
             inputText('Awalan kirim tanpa terjemah', 'raw_prefix')
@@ -815,14 +1052,8 @@ imgui.OnFrame(function() return ui.show[0] end, function()
             end
             imgui.Spacing()
             imgui.Checkbox('Tampilkan API key', ui.show_keys)
-            imgui.SetNextItemWidth(120)
-            if imgui.InputInt('Istirahat Gemini (detik)', ui.cooldown) then
-                if ui.cooldown[0] < 10 then ui.cooldown[0] = 10 end
-                cfg.gemini_cooldown = ui.cooldown[0]
-                markDirty()
-            end
-            if imgui.Button('Pakai Gemini lagi sekarang') then state.geminiBlockedUntil = 0 end
             imgui.Separator()
+            wrapped('Kena limit (429): provider dilewati sesuai waktu tunggu dari server. Key ditolak (401/403): dilewati 10 menit. Pesan tetap jalan lewat provider lain.')
             wrapped('Key disimpan di moonloader/config/str_translator.json (teks biasa). Jangan bagikan file itu.')
             imgui.EndTabItem()
         end
@@ -909,7 +1140,8 @@ function main()
     ui.out_lang[0]         = cfg.out_lang - 1
     ui.in_lang[0]          = cfg.in_lang - 1
     ui.min_letters[0]      = cfg.min_letters
-    ui.cooldown[0]         = cfg.gemini_cooldown
+    ui.max_rpm[0]          = cfg.max_rpm
+    ui.skip_indo[0]        = cfg.skip_indo
     for _, k in ipairs({ 'raw_prefix', 'cmd_list', 'gemini_key', 'gemini_model', 'groq_key', 'groq_model' }) do
         ffi.copy(ui[k], cfg[k]:sub(1, sizeof(ui[k]) - 1))
     end
@@ -936,7 +1168,7 @@ function main()
         end
     end)
 
-    notify('Loaded. Ketik {FFFF99}/str{FFFFFF} untuk menu, {FFFF99}/str on{FFFFFF} / {FFFF99}/str off{FFFFFF}.')
+    notify('Loaded v1.3. Ketik {FFFF99}/str{FFFFFF} untuk menu, {FFFF99}/str on{FFFFFF} / {FFFF99}/str off{FFFFFF}. CopyRight By:Bobwan.')
     if not state.libs.requests or not state.libs.ssl or not state.libs.effil then
         notify('{FF6666}Library kurang (effil / requests / ssl). Cek tab Test di /str.')
     end
@@ -944,16 +1176,23 @@ function main()
         notify('Belum ada API key. Isi dulu di {FFFF99}/str{FFFFFF} > tab API.')
     end
 
+    markDirty() -- simpan config (termasuk hasil migrasi versi lama)
+    local tick = 0
     while true do
-        wait(1000)
-        if dirty then
-            dirty = false
-            saveCfg()
-        end
-        -- bersihkan cache anti-duplikat
-        local now = os.clock()
-        for k, t in pairs(state.recent) do
-            if now - t > 10 then state.recent[k] = nil end
+        wait(250)
+        -- lanjutkan antrian pesan masuk yang tertahan batas request/menit
+        if #state.inQueue > 0 then pcall(processIn) end
+        tick = tick + 1
+        if tick % 4 == 0 then
+            if dirty then
+                dirty = false
+                saveCfg()
+            end
+            -- bersihkan cache anti-duplikat
+            local now = os.clock()
+            for k, t in pairs(state.recent) do
+                if now - t > 10 then state.recent[k] = nil end
+            end
         end
     end
 end
