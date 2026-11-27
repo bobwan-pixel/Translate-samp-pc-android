@@ -21,7 +21,7 @@
 
 script_name('STR Translator')
 script_author('bobwan-pixel')
-script_version('1.4')
+script_version('1.4.1')
 
 require 'lib.moonloader'
 local sampev   = require 'lib.samp.events'
@@ -1376,8 +1376,12 @@ function main()
     end
 
     sampRegisterChatCommand('str', function(arg)
-        arg = trim((arg or ''):lower())
-        if arg == 'on' then
+        arg = trim((arg or ''):lower()):gsub('%s+', ' ')
+        if arg == '' or arg == 'menu' then
+            ui.show[0] = not ui.show[0]
+        elseif arg == 'add' or arg == 'del' then
+            notify('Cara pakai: {FFFF99}/str ' .. arg .. ' ID{FFFFFF} atau {FFFF99}/str ' .. arg .. ' nama{FFFFFF}. Contoh: /str ' .. arg .. ' 12')
+        elseif arg == 'on' then
             cfg.enabled = true
             syncUiFromCfg()
             markDirty()
@@ -1421,11 +1425,21 @@ function main()
             markDirty()
             notify('Daftar fokus dikosongkan.')
         else
-            ui.show[0] = not ui.show[0]
+            notify('{FF6666}Perintah tidak dikenal: /str ' .. arg)
+            notify('Pakai: /str (menu), /str on, /str off, /str fokus, /str add ID, /str del ID, /str list, /str clear')
         end
     end)
 
-    notify('Loaded v1.4. Ketik {FFFF99}/str{FFFFFF} untuk menu, {FFFF99}/str on{FFFFFF} / {FFFF99}/str off{FFFFFF}. CopyRight By:Bobwan.')
+    notify('Loaded v1.4.1. Ketik {FFFF99}/str{FFFFFF} untuk menu, {FFFF99}/str on{FFFFFF} / {FFFF99}/str off{FFFFFF}. CopyRight By:Bobwan.')
+    -- peringatan kalau ada salinan script lain yang juga memakai /str (bikin bentrok)
+    pcall(function()
+        local me = thisScript()
+        for _, s in ipairs(script.list()) do
+            if s ~= me and (s.name == 'STR Translator' or tostring(s.filename):lower():find('str_trans')) then
+                notify('{FF6666}Ada script duplikat: ' .. tostring(s.filename) .. '. Hapus dari folder moonloader, perintah /str bentrok!')
+            end
+        end
+    end)
     if not state.libs.requests or not state.libs.ssl or not state.libs.effil then
         notify('{FF6666}Library kurang (effil / requests / ssl). Cek tab Test di /str.')
     end
