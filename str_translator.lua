@@ -6,6 +6,8 @@
       /str        buka / tutup menu
       /str on     nyalakan penerjemah
       /str off    matikan penerjemah  (/str of juga bisa)
+      /str fokus  mode fokus on/off (tempat ramai: hanya pemain tertentu)
+      /str add ID / /str del ID / /str list / /str clear   atur daftar fokus
 
     Kebutuhan (taruh di folder moonloader/lib):
       - SAMP.Lua (lib.samp.events)
@@ -19,7 +21,7 @@
 
 script_name('STR Translator')
 script_author('bobwan-pixel')
-script_version('1.3')
+script_version('1.4')
 
 require 'lib.moonloader'
 local sampev   = require 'lib.samp.events'
@@ -82,6 +84,13 @@ local cfg = {
     groq_model       = 'openai/gpt-oss-20b',
     max_rpm          = 20,      -- batas request per menit untuk pesan lawan (hindari 429)
     skip_indo        = true,    -- pesan lawan yang jelas bahasa Indonesia tidak dikirim ke AI
+    focus_mode       = false,   -- mode fokus: hanya terjemahkan pemain yang difokuskan
+    focus_names      = '',      -- daftar fokus manual (nickname, dipisah koma)
+    focus_auto_talk  = true,    -- fokus otomatis ke pemain di dekatmu saat kamu chat
+    focus_radius     = 5,       -- meter
+    focus_auto_target= true,    -- fokus otomatis ke pemain yang kamu bidik/target
+    focus_auto_min   = 3,       -- menit fokus otomatis berlaku
+    focus_notify     = true,    -- kabari di chat saat ada fokus otomatis baru
     cfg_version      = 3,
     debug            = false,   -- tampilkan jawaban mentah AI di chat
 }
@@ -270,7 +279,7 @@ local state = {
     recent = {},
     libs = {},
     reqTimes = {},
-    stats = { skipped = 0, dropped = 0, cached = 0, batches = 0 },
+    stats = { skipped = 0, dropped = 0, cached = 0, batches = 0, unfocused = 0 },
 }
 
 -- notifikasi yang sama paling sering sekali per 30 detik (tidak spam chat)
@@ -744,9 +753,136 @@ processIn = function()
     end
 end
 
+-- =========================================================================
+-- Mode fokus: di tempat ramai, hanya terjemahkan pemain tertentu
+--   * daftar manual  : /str add ID  (tersimpan di config, pakai nickname)
+--   * otomatis       : pemain di dekatmu saat kamu chat, pemain yang kamu
+--                      bidik/target, dan tujuan /pm /w  (berlaku beberapa menit)
+-- =========================================================================
+local focusAuto = {} -- nickname (huruf kecil) -> { nick = asli, expire = os.time, why = alasan }
+local FOCUS_PM_CMDS = { pm = true, w = true, whisper = true, sms = true }
+
+local function normName(n)
+    return (tostring(n or ''):gsub(' ', '_'):lower())
+end
+
+local function focusManualList()
+    local list = {}
+    for n in cfg.focus_names:gmatch('[^,%s]+') do list[#list + 1] = n end
+    return list
+end
+
+local function isFocused(name)
+    local n = normName(name)
+    for _, m in ipairs(focusManualList()) do
+        if m:lower() == n then return true end
+    end
+    local a = focusAuto[n]
+    return a ~= nil and a.expire > os.time()
+end
+
+local function focusAdd(nick)
+    for _, m in ipairs(focusManualList()) do
+        if m:lower() == nick:lower() then return false end
+    end
+    local list = focusManualList()
+    list[#list + 1] = nick
+    cfg.focus_names = table.concat(list, ',')
+    markDirty()
+    return true
+end
+
+local function focusRemove(nick)
+    local list, removed = {}, false
+    for _, m in ipairs(focusManualList()) do
+        if m:lower() == nick:lower() then removed = true else list[#list + 1] = m end
+    end
+    if focusAuto[nick:lower()] then focusAuto[nick:lower()] = nil; removed = true end
+    cfg.focus_names = table.concat(list, ',')
+    markDirty()
+    return removed
+end
+
+local function focusAutoAdd(nick, why)
+    if not nick or nick == '' then return end
+    local n = nick:lower()
+    local wasActive = focusAuto[n] and focusAuto[n].expire > os.time()
+    focusAuto[n] = { nick = nick, expire = os.time() + cfg.focus_auto_min * 60, why = why }
+    if not wasActive and cfg.focus_mode and cfg.focus_notify then
+        notifyThrottled('fa_' .. n, ('{AAAAAA}Fokus otomatis: %s (%s)'):format(nick, why))
+    end
+end
+
+-- cari pemain dari ID atau sebagian nama
+local function findPlayer(arg)
+    arg = trim(arg or '')
+    if arg == '' then return nil, 'isi ID atau nama' end
+    local id = tonumber(arg)
+    if id then
+        if sampIsPlayerConnected(id) then return sampGetPlayerNickname(id), id end
+        return nil, 'ID ' .. id .. ' tidak online'
+    end
+    local q, found = arg:lower(), nil
+    for i = 0, 1003 do
+        if sampIsPlayerConnected(i) then
+            local nick = sampGetPlayerNickname(i)
+            if nick and nick:lower():find(q, 1, true) then
+                if found then return nil, 'nama "' .. arg .. '" cocok dengan lebih dari satu pemain, pakai ID' end
+                found = { nick, i }
+            end
+        end
+    end
+    if found then return found[1], found[2] end
+    return nil, 'pemain "' .. arg .. '" tidak ditemukan'
+end
+
+local function playersNear(radius)
+    local res = {}
+    local ok, x, y, z = pcall(getCharCoordinates, PLAYER_PED)
+    if not ok then return res end
+    for i = 0, 1003 do
+        if sampIsPlayerConnected(i) then
+            local okh, has, ped = pcall(sampGetCharHandleBySampPlayerId, i)
+            if okh and has and doesCharExist(ped) then
+                local px, py, pz = getCharCoordinates(ped)
+                if getDistanceBetweenCoords3d(x, y, z, px, py, pz) <= radius then
+                    res[#res + 1] = sampGetPlayerNickname(i)
+                end
+            end
+        end
+    end
+    return res
+end
+
+local function autoFocusTalk()
+    if not cfg.focus_auto_talk then return end
+    for _, nick in ipairs(playersNear(cfg.focus_radius)) do
+        focusAutoAdd(nick, 'dekat saat kamu chat')
+    end
+end
+
+local function autoFocusTarget()
+    if not cfg.focus_auto_target then return end
+    local ok, res, ped = pcall(getCharPlayerIsTargeting, PLAYER_HANDLE)
+    if not ok or not res then return end
+    local ok2, has, id = pcall(sampGetPlayerIdByCharHandle, ped)
+    if ok2 and has then focusAutoAdd(sampGetPlayerNickname(id), 'kamu bidik') end
+end
+
+local function focusCount()
+    local n = #focusManualList()
+    local now = os.time()
+    for _, a in pairs(focusAuto) do if a.expire > now then n = n + 1 end end
+    return n
+end
+
 local function queueIn(name, text)
     text = trim(text)
     if countLetters(text) < cfg.min_letters then return end
+    if cfg.focus_mode and not isFocused(name) then
+        state.stats.unfocused = state.stats.unfocused + 1
+        return
+    end
     if cfg.skip_indo and LANGS[cfg.in_lang].name == 'Indonesian' and looksIndonesian(text) then
         state.stats.skipped = state.stats.skipped + 1
         return
@@ -773,7 +909,9 @@ end
 -- Hook SA-MP
 -- =========================================================================
 function sampev.onSendChat(msg)
-    if bypass or not cfg.enabled or not cfg.translate_out then return end
+    if bypass or not cfg.enabled then return end
+    if cfg.focus_mode then pcall(autoFocusTalk) end
+    if not cfg.translate_out then return end
     local p = cfg.raw_prefix
     if p ~= '' and msg:sub(1, #p) == p then
         local rest = trim(msg:sub(#p + 1))
@@ -793,7 +931,13 @@ local function cmdAllowed(cmd)
 end
 
 function sampev.onSendCommand(command)
-    if bypass or not cfg.enabled or not cfg.translate_out or not cfg.translate_cmds then return end
+    if bypass or not cfg.enabled then return end
+    -- /pm ID pesan, /w ID pesan -> pemain tujuan otomatis difokuskan
+    local pc, pid = command:match('^/(%S+)%s+(%d+)')
+    if pc and FOCUS_PM_CMDS[pc:lower()] and sampIsPlayerConnected(tonumber(pid)) then
+        focusAutoAdd(sampGetPlayerNickname(tonumber(pid)), '/' .. pc:lower())
+    end
+    if not cfg.translate_out or not cfg.translate_cmds then return end
     local cmd, rest = command:match('^/(%S+)%s+(.+)$')
     if not cmd or not cmdAllowed(cmd) then return end
     if countLetters(rest) < 1 then return end
@@ -854,6 +998,13 @@ local ui = {
     min_letters     = new.int(cfg.min_letters),
     max_rpm         = new.int(cfg.max_rpm),
     skip_indo       = new.bool(cfg.skip_indo),
+    focus_mode      = new.bool(cfg.focus_mode),
+    focus_auto_talk = new.bool(cfg.focus_auto_talk),
+    focus_auto_target = new.bool(cfg.focus_auto_target),
+    focus_notify    = new.bool(cfg.focus_notify),
+    focus_radius    = new.int(cfg.focus_radius),
+    focus_auto_min  = new.int(cfg.focus_auto_min),
+    focus_input     = new.char[32](''),
     raw_prefix      = new.char[8](cfg.raw_prefix),
     cmd_list        = new.char[128](cfg.cmd_list),
     gemini_key      = new.char[256](cfg.gemini_key),
@@ -873,6 +1024,7 @@ end
 
 local function syncUiFromCfg()
     ui.enabled[0] = cfg.enabled
+    ui.focus_mode[0] = cfg.focus_mode
 end
 
 local function testLog(line)
@@ -952,6 +1104,9 @@ imgui.OnFrame(function() return ui.show[0] end, function()
     if cfg.enabled then colored(0.4, 1, 0.4, 'Status: AKTIF') else colored(1, 0.4, 0.4, 'Status: MATI') end
     imgui.SameLine()
     imgui.TextUnformatted(('  |  Terakhir: %s (%d ms)  |  Antrian masuk: %d'):format(state.lastProvider, state.lastMs, #state.inQueue))
+    if cfg.focus_mode then
+        colored(0.5, 0.8, 1, ('Mode fokus ON: hanya %d pemain yang diterjemahkan  (/str list)'):format(focusCount()))
+    end
     for _, p in ipairs({ 'gemini', 'groq' }) do
         local left = state.blockedUntil[p] - os.time()
         if left > 0 then
@@ -994,8 +1149,8 @@ imgui.OnFrame(function() return ui.show[0] end, function()
                 cfg.max_rpm = ui.max_rpm[0]
                 markDirty()
             end
-            wrapped(('Dilewati (sudah Indonesia): %d  |  Dari cache: %d  |  Dibuang (kelamaan): %d  |  Request: %d'):format(
-                state.stats.skipped, state.stats.cached, state.stats.dropped, state.stats.batches))
+            wrapped(('Dilewati (sudah Indonesia): %d  |  Bukan fokus: %d  |  Dari cache: %d  |  Dibuang (kelamaan): %d  |  Request: %d'):format(
+                state.stats.skipped, state.stats.unfocused, state.stats.cached, state.stats.dropped, state.stats.batches))
             imgui.Separator()
             imgui.SetNextItemWidth(60)
             inputText('Awalan kirim tanpa terjemah', 'raw_prefix')
@@ -1055,6 +1210,70 @@ imgui.OnFrame(function() return ui.show[0] end, function()
             imgui.Separator()
             wrapped('Kena limit (429): provider dilewati sesuai waktu tunggu dari server. Key ditolak (401/403): dilewati 10 menit. Pesan tetap jalan lewat provider lain.')
             wrapped('Key disimpan di moonloader/config/str_translator.json (teks biasa). Jangan bagikan file itu.')
+            imgui.EndTabItem()
+        end
+
+        -- ---------------------------------------------------------------- Fokus
+        if imgui.BeginTabItem('Fokus') then
+            checkbox('Mode fokus (hanya terjemahkan pemain di daftar fokus)', 'focus_mode')
+            wrapped('Cocok di tempat ramai: pesan orang lain diabaikan, kuota API jauh lebih awet. Pesanmu sendiri tetap diterjemahkan.')
+            imgui.Separator()
+            colored(0.5, 0.8, 1, 'Fokus otomatis')
+            checkbox('Pemain di dekatku saat aku chat', 'focus_auto_talk')
+            imgui.SameLine()
+            imgui.SetNextItemWidth(90)
+            if imgui.InputInt('meter##radius', ui.focus_radius) then
+                if ui.focus_radius[0] < 1 then ui.focus_radius[0] = 1 end
+                cfg.focus_radius = ui.focus_radius[0]
+                markDirty()
+            end
+            checkbox('Pemain yang aku bidik / target', 'focus_auto_target')
+            imgui.TextUnformatted('Tujuan /pm dan /w juga otomatis difokuskan.')
+            imgui.SetNextItemWidth(90)
+            if imgui.InputInt('menit fokus otomatis berlaku', ui.focus_auto_min) then
+                if ui.focus_auto_min[0] < 1 then ui.focus_auto_min[0] = 1 end
+                cfg.focus_auto_min = ui.focus_auto_min[0]
+                markDirty()
+            end
+            checkbox('Kabari di chat saat ada fokus otomatis baru', 'focus_notify')
+            imgui.Separator()
+
+            colored(0.5, 0.8, 1, 'Daftar fokus manual (tersimpan)')
+            imgui.SetNextItemWidth(160)
+            imgui.InputText('##focusadd', ui.focus_input, sizeof(ui.focus_input))
+            imgui.SameLine()
+            if imgui.Button('Tambah (ID / nama)') then
+                local nick, err = findPlayer(ffistr(ui.focus_input))
+                if nick then
+                    focusAdd(nick)
+                    state.focusMsg = 'Ditambah: ' .. nick
+                    ffi.copy(ui.focus_input, '')
+                else
+                    state.focusMsg = err
+                end
+            end
+            if state.focusMsg then imgui.SameLine(); imgui.TextUnformatted(state.focusMsg) end
+            local manual = focusManualList()
+            if #manual == 0 then imgui.TextUnformatted('  (kosong)') end
+            for i, nick in ipairs(manual) do
+                if imgui.SmallButton('x##m' .. i) then focusRemove(nick) end
+                imgui.SameLine()
+                imgui.TextUnformatted(nick)
+            end
+            imgui.Spacing()
+            colored(0.5, 0.8, 1, 'Fokus otomatis aktif')
+            local now, any = os.time(), false
+            for key, a in pairs(focusAuto) do
+                if a.expire > now then
+                    any = true
+                    if imgui.SmallButton('x##a' .. key) then focusAuto[key] = nil end
+                    imgui.SameLine()
+                    imgui.TextUnformatted(('%s  -  %s, sisa %d detik'):format(a.nick, a.why, a.expire - now))
+                end
+            end
+            if not any then imgui.TextUnformatted('  (belum ada)') end
+            imgui.Separator()
+            wrapped('Perintah: /str fokus (on/off), /str add ID, /str del ID, /str list, /str clear')
             imgui.EndTabItem()
         end
 
@@ -1142,6 +1361,12 @@ function main()
     ui.min_letters[0]      = cfg.min_letters
     ui.max_rpm[0]          = cfg.max_rpm
     ui.skip_indo[0]        = cfg.skip_indo
+    ui.focus_mode[0]       = cfg.focus_mode
+    ui.focus_auto_talk[0]  = cfg.focus_auto_talk
+    ui.focus_auto_target[0]= cfg.focus_auto_target
+    ui.focus_notify[0]     = cfg.focus_notify
+    ui.focus_radius[0]     = cfg.focus_radius
+    ui.focus_auto_min[0]   = cfg.focus_auto_min
     for _, k in ipairs({ 'raw_prefix', 'cmd_list', 'gemini_key', 'gemini_model', 'groq_key', 'groq_model' }) do
         ffi.copy(ui[k], cfg[k]:sub(1, sizeof(ui[k]) - 1))
     end
@@ -1163,12 +1388,44 @@ function main()
             syncUiFromCfg()
             markDirty()
             notify('Penerjemah {FF6666}MATI{FFFFFF}.')
+        elseif arg:match('^fokus') or arg:match('^focus') then
+            local v = arg:match('^%a+%s+(%a+)$')
+            if v == 'on' then cfg.focus_mode = true
+            elseif v == 'off' or v == 'of' then cfg.focus_mode = false
+            else cfg.focus_mode = not cfg.focus_mode end
+            syncUiFromCfg()
+            markDirty()
+            notify('Mode fokus ' .. (cfg.focus_mode and '{66FF66}ON' or '{FF6666}OFF') .. '{FFFFFF}. '
+                .. (cfg.focus_mode and ('Pesan lawan hanya diterjemahkan dari %d pemain yang difokuskan.'):format(focusCount()) or 'Semua pesan lawan diterjemahkan.'))
+        elseif arg:match('^add%s') or arg:match('^del%s') then
+            local action, who = arg:match('^(%a+)%s+(.+)$')
+            local nick, err = findPlayer(who)
+            if not nick then return notify('{FF6666}' .. err) end
+            if action == 'add' then
+                if focusAdd(nick) then notify('Fokus ditambah: {FFFF99}' .. nick) else notify(nick .. ' sudah ada di daftar fokus.') end
+                if not cfg.focus_mode then notify('Mode fokus masih OFF. Ketik {FFFF99}/str fokus{FFFFFF} untuk menyalakan.') end
+            else
+                if focusRemove(nick) then notify('Fokus dihapus: ' .. nick) else notify(nick .. ' tidak ada di daftar fokus.') end
+            end
+        elseif arg == 'list' then
+            local names = focusManualList()
+            local now, autos = os.time(), {}
+            for _, a in pairs(focusAuto) do
+                if a.expire > now then autos[#autos + 1] = ('%s (%dm)'):format(a.nick, math.ceil((a.expire - now) / 60)) end
+            end
+            notify(('Mode fokus %s. Manual: %s'):format(cfg.focus_mode and 'ON' or 'OFF', #names > 0 and table.concat(names, ', ') or '-'))
+            notify('Otomatis: ' .. (#autos > 0 and table.concat(autos, ', ') or '-'))
+        elseif arg == 'clear' then
+            cfg.focus_names = ''
+            focusAuto = {}
+            markDirty()
+            notify('Daftar fokus dikosongkan.')
         else
             ui.show[0] = not ui.show[0]
         end
     end)
 
-    notify('Loaded v1.3. Ketik {FFFF99}/str{FFFFFF} untuk menu, {FFFF99}/str on{FFFFFF} / {FFFF99}/str off{FFFFFF}. CopyRight By:Bobwan.')
+    notify('Loaded v1.4. Ketik {FFFF99}/str{FFFFFF} untuk menu, {FFFF99}/str on{FFFFFF} / {FFFF99}/str off{FFFFFF}. CopyRight By:Bobwan.')
     if not state.libs.requests or not state.libs.ssl or not state.libs.effil then
         notify('{FF6666}Library kurang (effil / requests / ssl). Cek tab Test di /str.')
     end
@@ -1182,6 +1439,7 @@ function main()
         wait(250)
         -- lanjutkan antrian pesan masuk yang tertahan batas request/menit
         if #state.inQueue > 0 then pcall(processIn) end
+        if cfg.enabled and cfg.focus_mode then pcall(autoFocusTarget) end
         tick = tick + 1
         if tick % 4 == 0 then
             if dirty then
