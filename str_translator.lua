@@ -21,7 +21,7 @@
 
 script_name('STR Translator')
 script_author('bobwan-pixel')
-script_version('1.4.2')
+script_version('1.5')
 
 require 'lib.moonloader'
 local sampev   = require 'lib.samp.events'
@@ -869,6 +869,45 @@ local function autoFocusTarget()
     if ok2 and has then focusAutoAdd(sampGetPlayerNickname(id), 'kamu bidik') end
 end
 
+-- daftar pemain online + jarak (untuk halaman Tambah Fokus), diperbarui tiap 1 detik
+local playerListCache = { t = -10, list = {} }
+local function getPlayerList()
+    local now = os.clock()
+    if now - playerListCache.t < 1 then return playerListCache.list end
+    local list = {}
+    local okMe, mx, my, mz = pcall(getCharCoordinates, PLAYER_PED)
+    for i = 0, 1003 do
+        if sampIsPlayerConnected(i) then
+            local nick = sampGetPlayerNickname(i)
+            local dist
+            if okMe then
+                local okh, has, ped = pcall(sampGetCharHandleBySampPlayerId, i)
+                if okh and has and doesCharExist(ped) then
+                    local px, py, pz = getCharCoordinates(ped)
+                    dist = getDistanceBetweenCoords3d(mx, my, mz, px, py, pz)
+                end
+            end
+            list[#list + 1] = { id = i, nick = nick or ('ID ' .. i), dist = dist }
+        end
+    end
+    -- yang terlihat & paling dekat di atas, sisanya urut ID
+    table.sort(list, function(a, b)
+        if a.dist and b.dist then return a.dist < b.dist end
+        if a.dist then return true end
+        if b.dist then return false end
+        return a.id < b.id
+    end)
+    playerListCache.t, playerListCache.list = now, list
+    return list
+end
+
+local function isManualFocus(nick)
+    for _, m in ipairs(focusManualList()) do
+        if m:lower() == nick:lower() then return true end
+    end
+    return false
+end
+
 local function focusCount()
     local n = #focusManualList()
     local now = os.time()
@@ -1005,6 +1044,8 @@ local ui = {
     focus_radius    = new.int(cfg.focus_radius),
     focus_auto_min  = new.int(cfg.focus_auto_min),
     focus_input     = new.char[32](''),
+    add_search      = new.char[32](''),
+    add_near_only   = new.bool(false),
     raw_prefix      = new.char[8](cfg.raw_prefix),
     cmd_list        = new.char[128](cfg.cmd_list),
     gemini_key      = new.char[256](cfg.gemini_key),
@@ -1213,6 +1254,68 @@ imgui.OnFrame(function() return ui.show[0] end, function()
             imgui.EndTabItem()
         end
 
+        -- ---------------------------------------------------------------- Tambah Fokus
+        local addFlags = 0
+        if state.selectTab == 'add' then
+            local okF, f = pcall(function() return imgui.TabItemFlags.SetSelected end)
+            addFlags = okF and f or 0
+            state.selectTab = nil
+        end
+        if imgui.BeginTabItem('Tambah Fokus', nil, addFlags) then
+            if cfg.focus_mode then
+                colored(0.4, 1, 0.4, 'Mode fokus ON')
+            else
+                colored(1, 0.6, 0.3, 'Mode fokus OFF (daftar tetap disimpan)')
+            end
+            imgui.SameLine()
+            if imgui.SmallButton(cfg.focus_mode and 'Matikan' or 'Nyalakan') then
+                cfg.focus_mode = not cfg.focus_mode
+                syncUiFromCfg()
+                markDirty()
+            end
+            imgui.Separator()
+
+            imgui.SetNextItemWidth(200)
+            imgui.InputText('Cari nama / ID', ui.add_search, sizeof(ui.add_search))
+            imgui.SameLine()
+            imgui.Checkbox('Hanya yang terlihat', ui.add_near_only)
+
+            local q = ffistr(ui.add_search):lower()
+            local qid = tonumber(q)
+            local list = getPlayerList()
+            local shown = 0
+            imgui.BeginChild('playerlist', imgui.ImVec2(0, 0), true)
+            for _, pl in ipairs(list) do
+                local match = (q == '') or (qid and pl.id == qid) or pl.nick:lower():find(q, 1, true)
+                if match and (not ui.add_near_only[0] or pl.dist) then
+                    shown = shown + 1
+                    if shown > 120 then
+                        imgui.TextUnformatted('... persempit dengan kolom cari')
+                        break
+                    end
+                    local inFocus = isManualFocus(pl.nick)
+                    if inFocus then
+                        if imgui.SmallButton('Hapus##' .. pl.id) then focusRemove(pl.nick) end
+                    else
+                        if imgui.SmallButton('Tambah##' .. pl.id) then focusAdd(pl.nick) end
+                    end
+                    imgui.SameLine()
+                    local label = ('[%d] %s'):format(pl.id, pl.nick)
+                    if pl.dist then label = label .. ('  -  %.0f m'):format(pl.dist) end
+                    if inFocus then
+                        colored(0.4, 1, 0.4, label .. '  (fokus)')
+                    elseif isFocused(pl.nick) then
+                        colored(0.6, 0.85, 1, label .. '  (fokus otomatis)')
+                    else
+                        imgui.TextUnformatted(label)
+                    end
+                end
+            end
+            if shown == 0 then imgui.TextUnformatted('Tidak ada pemain yang cocok.') end
+            imgui.EndChild()
+            imgui.EndTabItem()
+        end
+
         -- ---------------------------------------------------------------- Fokus
         if imgui.BeginTabItem('Fokus') then
             checkbox('Mode fokus (hanya terjemahkan pemain di daftar fokus)', 'focus_mode')
@@ -1380,7 +1483,9 @@ function main()
         if arg == '' or arg == 'menu' then
             ui.show[0] = not ui.show[0]
         elseif arg == 'add' or arg == 'del' then
-            notify('Cara pakai: {FFFF99}/str ' .. arg .. ' ID{FFFFFF} atau {FFFF99}/str ' .. arg .. ' nama{FFFFFF}. Contoh: /str ' .. arg .. ' 12')
+            -- tanpa ID: buka halaman Tambah Fokus
+            ui.show[0] = true
+            state.selectTab = 'add'
         elseif arg == 'on' then
             cfg.enabled = true
             syncUiFromCfg()
@@ -1434,22 +1539,10 @@ function main()
     pcall(sampUnregisterChatCommand, 'str')
     local okReg, reg = pcall(sampRegisterChatCommand, 'str', strCommand)
     if not okReg or reg == false then
-        notify('{FF6666}Perintah /str dipakai script lain. Pakai /strmenu, /stradd, /strdel, /strfokus, /strlist.')
-    end
-    -- perintah cadangan yang tidak bisa bentrok
-    local backup = {
-        strmenu  = function() strCommand('') end,
-        stradd   = function(a) strCommand('add ' .. (a or '')) end,
-        strdel   = function(a) strCommand('del ' .. (a or '')) end,
-        strfokus = function(a) strCommand('fokus ' .. (a or '')) end,
-        strlist  = function() strCommand('list') end,
-    }
-    for name, fn in pairs(backup) do
-        pcall(sampUnregisterChatCommand, name)
-        pcall(sampRegisterChatCommand, name, fn)
+        notify('{FF6666}Perintah /str dipakai script lain. Hapus salinan script lama di folder moonloader.')
     end
 
-    notify('Loaded v1.4.2. Ketik {FFFF99}/str{FFFFFF} untuk menu, {FFFF99}/str on{FFFFFF} / {FFFF99}/str off{FFFFFF}. CopyRight By:Bobwan.')
+    notify('Loaded v1.5. Ketik {FFFF99}/str{FFFFFF} untuk menu, {FFFF99}/str on{FFFFFF} / {FFFF99}/str off{FFFFFF}. CopyRight By:Bobwan.')
     -- peringatan kalau ada salinan script lain yang juga memakai /str (bikin bentrok)
     pcall(function()
         local me = thisScript()
